@@ -110,12 +110,16 @@ a 400-connection budget. Everything else gets 25 distinct IPs. A firefox with 60
 connections is a firefox. A `python3` with 60 connections to 40 different /16s
 is a proxy.
 
-**R01 and R02, relay software by name and by content.** Sixty-plus executable
-names, including the residential agents (Bright Data, IPRoyal, Smartproxy,
-Webshare, NetNut, PacketStream, Pawnacle, Proxidize). Then a byte-pattern scan
-for SOCKS handshakes, `CONNECT %s:%d HTTP/1.`, Tor relay directives and vendor
-strings. R02 is what catches the renamed binary. It is discounted for browsers
-and interpreters, which link proxy code legitimately.
+**R01 and R02, relay software by name and by content.**
+
+R01 matches executable names. Sixty-plus of them, including the residential
+agents: Bright Data, IPRoyal, Smartproxy, Webshare, NetNut, PacketStream,
+Pawnacle, Proxidize.
+
+R02 looks inside the executable for SOCKS handshakes, `CONNECT %s:%d HTTP/1.`,
+Tor relay directives and vendor strings. This is what catches a renamed binary.
+It is discounted for browsers and interpreters, which link proxy code
+legitimately.
 
 **R06, vendor strings** in any process's command line, cwd or environment.
 Catches enrolment before traffic flows.
@@ -138,9 +142,9 @@ opinion. A packet capture is a fact.
 
 ## Containment
 
-Every mode name is validated. A typo in `respond.mode` falls back to
-`observe`, and `ward status` says so. WARD never does more than it was asked to
-do because of a spelling mistake.
+Every mode name is validated. A typo in `respond.mode` falls back to `observe`,
+and `ward status` says so. WARD never does more than it was asked to do because
+of a spelling mistake.
 
 | Mode | Does |
 |------|------|
@@ -222,13 +226,16 @@ interface.
 70/70 passed
 ```
 
-Roughly a quarter of the codebase is tests. Two of those checks are worth
-naming: one runs a full scan after every fixture is torn down and requires an
-idle machine to score zero, and one walks the source for functions and config
-keys that nothing references. The second exists because 14 dead functions and
-21 unread config knobs had accumulated. A knob nothing reads is worse than no
-knob, because an operator reads `relay_mbps_threshold` and believes it does
-something.
+Roughly a quarter of the codebase is tests. Two of the checks are worth knowing
+about:
+
+- one runs a full scan after every fixture is torn down and requires an idle
+  machine to score zero
+- one walks the source for functions and config keys that nothing references
+
+The second one exists because 14 dead functions and 21 unread config knobs had
+accumulated. A knob nothing reads is worse than no knob, because an operator
+reads `relay_mbps_threshold` and believes it does something.
 
 ## A note on detection patterns
 
@@ -236,11 +243,17 @@ The byte patterns in `signatures.py` were measured, not guessed. Every candidate
 was counted across 76,279 files under `/usr/bin`, `/usr/sbin`, `/usr/lib` and
 `/usr/local` before being kept.
 
-That process removed more patterns than it added. The obvious three-byte SOCKS5
-greeting `\x05\x01\x00` appears in almost every binary and was deleted.
-`socks4://` appears in glib. `ngrok` appears in git-lfs and Qt. `Xray` appears
-in inxi. Patterns that only occur in relay software are tier A and count on
-their own. Everything else is tier B and needs two corroborating hits.
+That process removed more patterns than it added. Four that had to go:
+
+| needle | why |
+|---|---|
+| `\x05\x01\x00` | three bytes, and it is in almost every binary |
+| `socks4://` | appears in glib, which handles proxy URLs properly |
+| `ngrok` | appears in git-lfs and Qt |
+| `Xray` | appears in inxi |
+
+What survived splits into two tiers. Tier A occurs only in relay software and
+counts on its own. Tier B needs two corroborating hits.
 
 A regex that fails to compile silently degrades to a literal string match under
 `re.escape`, which is how a detection rule dies without anyone noticing. The
@@ -248,29 +261,55 @@ self-test asserts the fallback set stays empty.
 
 ## Commands
 
+`ward -h` groups these the same way, by what you are trying to do.
+
+**Start here**
+
 ```
-ward status              one-shot verdict (safe to run without sudo)
-ward scan [--json]       full finding list
-ward watch               live loop, foreground
-ward daemon              supervised background loop
-ward harden [--dry-run]  apply host hardening
-ward restore             undo journalled hardening
-ward firewall [--apply]  render or install the nftables table
-ward counters            packet counters from the live table
-ward lockdown            maximum containment
-ward kill PID            terminate a process, with evidence
-ward watch-wire [SECS]   live packet inspection
-ward analyze-pcap FILE   decode a capture
-ward report              incident report
-ward events [--verify]   read or verify the log
-ward baseline [--reset]  learn or show the known-good inventory
-ward tripwire            check the daemon heartbeat
-ward explain R05         why a rule exists
-ward selftest            prove the detector fires
-ward unquarantine        undo a containment port drop
-ward release PID         unfreeze a process, restore its exec bit
-ward seal                record hashes of WARD's own files
+ward status       one-shot verdict, safe without sudo
+ward explain R05  why a rule exists
+ward selftest     prove the detector and the safety properties
 ```
+
+**Look around** (read-only)
+
+```
+ward scan         the full finding list, not a summary
+ward report       incident report, human-readable
+ward events       read the hash-chained log
+ward counters     firewall packet counters
+ward baseline     the known-good inventory WARD diffs against
+ward tripwire     is the daemon still alive and honest
+```
+
+**Check it works**
+
+```
+ward watch           scan on a loop in the foreground
+ward watch-wire      live packet inspection for proxy protocols
+ward analyze-pcap    decode a capture someone else took
+```
+
+**Change the machine** (needs root, all of it reversible)
+
+```
+ward harden      sysctl, LLMNR, sshd pinning, firewalld ports
+ward restore     undo journalled hardening
+ward firewall    render or install the nftables table
+ward seal        record hashes of WARD's own files
+```
+
+**Respond to an incident**
+
+```
+ward lockdown       maximum containment
+ward kill PID       terminate a process, with evidence first
+ward unquarantine   undo a containment port drop
+ward release PID    unfreeze a process, restore its exec bit
+```
+
+Every command has its own help, and an unknown command suggests the closest
+match rather than printing all of them.
 
 Exit code is 0 below score 70 and 1 at or above, so `ward status` works as a
 monitoring check.
@@ -315,12 +354,16 @@ Measured on this host, not estimated:
 | steady-state CPU | 15.4% of a core | under 1% |
 | scan interval | 3s | 10s |
 
-Three things got it there. `firewall-cmd` was being run every cycle, and its
-D-Bus round trip took 8.02s on its own, longer than the whole interval. Rules
-that answer "how is this machine configured" are now cached for
-`detect.external_interval_seconds`. And the default interval went from 3s to
-10s, which is where most of the CPU saving came from: a scan costs 0.26s, so
-running it every 3s is 8.5% of a core forever.
+Three changes got it there:
+
+1. `firewall-cmd` ran every cycle. Its D-Bus round trip took 8.02s on its own,
+   longer than the whole interval. Rules that answer "how is this machine
+   configured" are cached for `detect.external_interval_seconds` instead.
+2. `observe_processes()` called `observe_sockets()` internally while `scan()`
+   had already called it, so every `/proc/*/fd` was walked twice per cycle.
+3. The default interval went from 3s to 10s. This is where most of the saving
+   came from: a scan costs 0.26s, so running one every 3s is 8.5% of a core
+   forever.
 
 The interval change costs almost nothing in detection latency. The tripwire runs
 every 60s regardless, and R05 needs two consecutive samples before it

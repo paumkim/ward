@@ -24,6 +24,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import textwrap
 import sys
 import time
 from typing import Any
@@ -657,64 +659,155 @@ def cmd_tripwire(args) -> int:
     return 0 if action.ok else 1
 
 
-EXPLAIN = {
-    "R01": "A process whose executable or arguments are a known relay: SOCKS servers, "
-           "gost/3proxy/dante, FRP, ngrok, and the residential-network agents "
-           "(Bright Data, IPRoyal, Smartproxy, Webshare, NetNut, PacketStream...). "
-           "Fires on renamed binaries less often -- that is what R02/R05 are for.",
-    "R02": "The executable's bytes contain SOCKS handshakes, HTTP CONNECT request "
-           "builders, Tor relay directives, or vendor strings. Catches a proxy that "
-           "was renamed to something innocent. Discounted for browsers and "
-           "interpreters, which legitimately link proxy code.",
-    "R03": "A TCP listener bound to a non-loopback address. This is the single most "
-           "important rule: a proxy needs an inbound door. A listener on a known relay "
-           "port scores 55+, on 0.0.0.0/:: another 15. Allowlisted LAN ports are "
-           "excluded.",
-    "R04": "A UDP listener reachable from the network. Covers DNS amplification "
-           "relays and SOCKS-over-UDP, which do not show up as TCP listeners.",
-    "R05": "Behavioural: one process holding many established connections to many "
-           "unrelated remote IPs across many /16s. This is the rule that catches a "
-           "renamed proxy, because renaming does not change the traffic shape. "
-           "Browsers and dev toolchains get a much higher budget; everyone else gets "
-           "25 distinct IPs.",
-    "R06": "Residential-proxy vendor names in a process's command line, cwd, or "
-           "environment. Cheap, high-precision, catches enrolment before traffic flows.",
-    "R07": "Routing capability: ip_forward=1, IPv6 forwarding, NAT masquerade rules, "
-           "a forward chain with policy accept, or ICMP redirects. On a laptop these "
-           "have no legitimate use and are the mechanism by which a neighbour's "
-           "traffic gets carried over your uplink.",
-    "R08": "Tor configured as a relay or exit (ORPort, ExitRelay, DirPort), or Tor "
-           "ports reachable from the network. Scored lower when tor is not running, "
-           "since a config file alone is not traffic.",
-    "R09": "Unexpected virtual interfaces and loaded tunnel modules (tun, wireguard, "
-           "tap). No client means nothing is tunnelling, so this is deliberately low.",
-    "R10": "Watched config files changed, or new files appeared in persistence "
-           "directories (systemd units, cron, /usr/local/bin). A proxy that survives a "
-           "reboot has to persist somewhere.",
-    "R11": "Diff against the learned baseline: a new world-reachable listener, a new "
-           "relay process, or a new tunnel kernel module since WARD first ran.",
-    "R12": "Anti-forensics: LD_PRELOAD injected, or a process running from a deleted "
-           "binary while holding sockets. Both are ways to hide a relay from lsof/ss.",
-    "R13": "The host firewall (firewalld) publicly opens a port. An open port there is "
-           "open to the world, whatever the local process thinks about 127.0.0.1.",
-    "R14": "Interface-level egress asymmetry. Relaying other people's traffic produces "
-           "far more outbound than inbound; normal use is roughly balanced. Needs a "
-           "large absolute volume before it counts.",
+#: What each rule is for, split into fields. One long string per rule turned
+#: `ward explain` into a wall of prose; the fields make it scannable and the
+#: selftest asserts every rule has them.
+EXPLAIN: dict[str, dict[str, str]] = {
+    "R01": {
+        "label": "relay software by name",
+        "what": "a process whose executable or arguments are a known relay",
+        "catches": "dante, gost, 3proxy, FRP, ngrok, and the residential-network "
+                   "agents (Bright Data, IPRoyal, Smartproxy, Webshare, NetNut, "
+                   "PacketStream, Pawnacle, Proxidize)",
+        "limits": "a renamed binary slips past. R02 and R05 are the net for that.",
+    },
+    "R02": {
+        "label": "proxy markers inside the binary",
+        "what": "the executable's bytes contain proxy-protocol markers",
+        "catches": "SOCKS handshakes, HTTP CONNECT request builders, Tor relay "
+                   "directives, vendor strings",
+        "limits": "discounted for browsers and interpreters, which legitimately "
+                  "link proxy code. Two tiers: tier A counts alone, tier B needs "
+                  "a second hit.",
+    },
+    "R03": {
+        "label": "network-reachable listener",
+        "what": "a TCP listener bound to a non-loopback address",
+        "why it matters": "a proxy needs an inbound door, and a laptop has no "
+                          "business having one",
+        "scores": "30 for any world-bound port, 55 on a known relay port, "
+                  "another 15 on 0.0.0.0 or ::. Allowlisted LAN ports are skipped, "
+                  "in both their IPv4 and IPv6 form.",
+    },
+    "R04": {
+        "label": "network-reachable UDP listener",
+        "what": "a UDP listener reachable from the network",
+        "why it matters": "covers DNS amplification relays and SOCKS over UDP, "
+                          "which never appear as a TCP listener",
+    },
+    "R05": {
+        "label": "connection fan-out",
+        "what": "one process, many unrelated remote IPs",
+        "why it matters": "this is the rule that catches a renamed proxy, "
+                          "because renaming a binary does not change the shape of "
+                          "its traffic",
+        "thresholds": "25 distinct IPs and 8 distinct /16s. Browsers, toolchains "
+                      "and P2P clients get a much larger budget.",
+        "limits": "a legitimate peer-to-peer client with 25+ peers looks similar. "
+                  "Those are allowlisted by name.",
+    },
+    "R06": {
+        "label": "residential vendor reference",
+        "what": "residential-proxy vendor names near a process",
+        "why it matters": "catches enrolment before any traffic flows",
+        "scoring": "70 in an executable path, cwd or environment, which is "
+                   "structural evidence. 20 in the argument list of a shell or "
+                   "editor, which is just text someone typed.",
+    },
+    "R07": {
+        "label": "routing and NAT capability",
+        "what": "routing and NAT capability",
+        "why it matters": "on a laptop these have no legitimate use, and they are "
+                          "how a neighbour's traffic gets carried over your uplink",
+        "covers": "ip_forward, IPv6 forwarding, NAT masquerade, a forward chain "
+                  "with policy accept, ICMP redirects",
+    },
+    "R08": {
+        "label": "Tor as a relay",
+        "what": "Tor configured as a relay or exit rather than a client",
+        "why it matters": "a client is privacy. A relay is strangers' traffic.",
+        "how": "parses /etc/tor/torrc and ignores commented directives, so a stock "
+               "config does not read as a relay. Scored lower when tor is not "
+               "running, since a config file is not traffic.",
+    },
+    "R09": {
+        "label": "unexpected interfaces and tun modules",
+        "what": "unexpected virtual interfaces and tunnel kernel modules",
+        "why it matters": "no client means nothing is tunnelling",
+        "why it is low": "deliberately. This is a hint, not evidence.",
+    },
+    "R10": {
+        "label": "config and persistence drift",
+        "what": "watched config files changed, or new files in persistence dirs",
+        "why it matters": "a proxy that survives a reboot has to persist somewhere",
+        "covers": "systemd units, cron, /usr/local/bin, ~/.ssh",
+    },
+    "R11": {
+        "label": "diff against the baseline",
+        "what": "a diff against the baseline learned on first run",
+        "covers": "a new world-reachable listener, a new relay process, a new "
+                  "tunnel kernel module",
+    },
+    "R12": {
+        "label": "anti-forensics",
+        "what": "anti-forensics and anti-analysis",
+        "covers": "LD_PRELOAD from outside the application's own libraries, a "
+                  "process running from a deleted binary while holding sockets",
+        "limits": "a self-preload is normal. Firefox injects its own sandbox into "
+                  "every child, so that case is ignored.",
+    },
+    "R13": {
+        "label": "host firewall open port",
+        "what": "the host firewall publicly opens a port",
+        "why it matters": "an open port on the firewall is open to the world, "
+                          "whatever the local process thinks about 127.0.0.1",
+        "limits": "cached for five minutes. firewall-cmd is a slow subprocess and "
+                  "a firewall zone does not change between scans.",
+    },
+    "R14": {
+        "label": "egress asymmetry",
+        "what": "interface-level egress asymmetry",
+        "why it matters": "relaying other people's traffic produces far more "
+                          "outbound than inbound; normal use is roughly balanced",
+        "limits": "needs a large absolute volume before it counts at all",
+    },
 }
+
+#: Rules that answer a question the operator asked, with the question first.
+EXPLAIN_ORDER = ["what", "why it matters", "catches", "scores", "thresholds",
+                 "scoring", "covers", "how", "why it is low", "limits"]
 
 
 def cmd_explain(args) -> int:
     key = args.rule.upper()
     if not key.startswith("R"):
         key = "R" + key
-    for prefix, text in EXPLAIN.items():
-        if key.startswith(prefix):
+    # Accept R3 as R03, and R3b as R03.
+    if len(key) == 2 and key[1].isdigit():
+        key = f"R0{key[1]}"
+    for rid, fields in EXPLAIN.items():
+        if not key.startswith(rid):
+            continue
+        print()
+        print("  " + c(rid.ljust(5), BOLD) + c(fields["label"], CYAN))
+        print()
+        label_w = max(len(k) for k in EXPLAIN_ORDER if k in fields) + 2
+        width = min(shutil.get_terminal_size((80, 24)).columns, 88) - 4 - label_w
+        for field in EXPLAIN_ORDER:
+            if field not in fields:
+                continue
+            text = " ".join(fields[field].split())
+            lines = textwrap.wrap(text, width) if width > 20 else [text]
+            print("  " + c(field.ljust(label_w), DIM) + lines[0])
+            for extra in lines[1:]:
+                print(" " * (4 + label_w) + extra)
             print()
-            print(c(f"  {key}", BOLD))
-            print(text)
-            print()
-            return 0
-    print(f"  no rule {args.rule}. known: {', '.join(sorted(EXPLAIN))}")
+        related = [f for f in ("watch-wire", "scan", "explain") if True]
+        print(c("  see also: ward scan   ward selftest", DIM))
+        print()
+        return 0
+    print(f"  no rule {args.rule}.")
+    print(f"  known: {', '.join(sorted(EXPLAIN, key=lambda r: int(r[1:])))}")
     return 1
 
 
@@ -727,16 +820,104 @@ def cmd_selftest(args) -> int:
 # ------------------------------------------------------------------ parser
 
 
+#: How the commands are grouped on `ward -h`. Alphabetical order tells you
+#: nothing about what to run first or what is safe, so the help is organised by
+#: what you are trying to do. Order here is the order on screen.
+COMMAND_GROUPS: list[tuple[str, str, list[str]]] = [
+    ("Start here", "the three you will actually use", [
+        ("status", "one-shot verdict, safe without sudo"),
+        ("explain", "why a rule exists"),
+        ("selftest", "prove the detector and the safety properties"),
+    ]),
+    ("Look around", "read-only, nothing is changed", [
+        ("scan", "every finding, not just the summary"),
+        ("report", "incident report, human-readable"),
+        ("events", "read the hash-chained event log"),
+        ("counters", "firewall packet counters"),
+        ("baseline", "the known-good inventory WARD diffs against"),
+        ("tripwire", "is the daemon still alive and honest"),
+    ]),
+    ("Check it works", "prove the claims rather than trust them", [
+        ("watch", "scan on a loop in the foreground"),
+        ("watch-wire", "live packet inspection for proxy protocols"),
+        ("analyze-pcap", "decode a capture someone else took"),
+    ]),
+    ("Change the machine", "needs root, all of it reversible", [
+        ("harden", "sysctl, LLMNR, sshd pinning, firewalld ports"),
+        ("restore", "undo journalled hardening"),
+        ("firewall", "render or install the nftables table"),
+        ("seal", "record hashes of WARD's own files"),
+    ]),
+    ("Respond to an incident", "containment, and the undo for each", [
+        ("lockdown", "maximum containment"),
+        ("kill", "terminate a process, with evidence first"),
+        ("unquarantine", "undo a containment port drop"),
+        ("release", "unfreeze a process, restore its exec bit"),
+    ]),
+    ("Run in the background", "what systemd does for you", [
+        ("daemon", "the supervised scan loop"),
+    ]),
+]
+
+_GROUP_OF: dict[str, tuple[str, str]] = {
+    cmd: (title, blurb) for title, blurb, cmds in COMMAND_GROUPS for cmd, _h in cmds
+}
+
+
+def format_grouped_help() -> str:
+    """Render `ward -h` as groups instead of one alphabetical wall.
+
+    argparse can give a set of subparsers only one title, so the grouping is
+    rendered here. Every command still has its own `ward <cmd> -h`.
+    """
+    terminal = shutil.get_terminal_size((80, 24)).columns
+    width = min(max(terminal, 64), 96)
+    name_w = max(len(n) for _t, _b, cmds in COMMAND_GROUPS for n, _h in cmds)
+    name_w = max(name_w, len("--config CONFIG"))
+    title_w = max(len(title) for title, _b, _c in COMMAND_GROUPS) + 2
+    title_w = max(title_w, name_w + 2)
+    rule = "\u2500" * min(width - 2, 74)
+
+    out: list[str] = [
+        "",
+        "  " + c("WARD", BOLD) + "  "
+        + c("keep this machine from being sold as a residential proxy", DIM),
+        c("  " + rule, DIM),
+    ]
+    for title, blurb, cmds in COMMAND_GROUPS:
+        out.append("")
+        out.append("  " + c(title.ljust(title_w), BOLD) + c(blurb, DIM))
+        for name, summary in cmds:
+            out.append("    " + c(name.ljust(name_w), CYAN) + "  " + summary)
+    out += [
+        "",
+        "  " + c("Other", BOLD),
+        "    " + c("--config CONFIG".ljust(name_w), CYAN) + "  use a different ward.toml",
+        "    " + c("-h, --help".ljust(name_w), CYAN) + "  this screen",
+        "",
+        c("  Every command has its own help: ward scan -h", DIM),
+        "",
+    ]
+    return "\n".join(out)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ward",
         description="WARD -- keep this machine from being sold as a residential proxy",
+        add_help=False,
     )
     p.add_argument("--config", help="path to ward.toml")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p.add_argument("-h", "--help", action="store_true", dest="want_help",
+                   help="show this screen")
+    sub = p.add_subparsers(dest="cmd", required=False)
+
+    curated = {n: s for _t, _b, cmds in COMMAND_GROUPS for n, s in cmds}
 
     def add(name, func, help_):
-        sp = sub.add_parser(name, help=help_)
+        sp = sub.add_parser(name, help=help_,
+                            description=curated.get(name, help_),
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
         sp.set_defaults(func=func)
         return sp
 
@@ -823,7 +1004,37 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # `ward` with nothing to do should teach, not scold.
+    if not argv or argv[0] in ("-h", "--help"):
+        sys.stdout.write(format_grouped_help())
+        return 0
+
+    # Check the command name before argparse does, so a typo gets a suggestion
+    # instead of a 21-command usage dump.
+    known = list(_GROUP_OF)
+    word = next((a for a in argv if not a.startswith("-")), "")
+    if word and word not in known:
+        import difflib
+
+        print()
+        print(f"  {c('unknown command', RED)} {word!r}")
+        for near in difflib.get_close_matches(word, known, n=3, cutoff=0.45):
+            summary = dict(
+                (n, s) for _t, _b, cmds in COMMAND_GROUPS for n, s in cmds
+            )[near]
+            print(f"    {c(near.ljust(14), CYAN)}{summary}")
+        print(f"    {c('ward -h'.ljust(14), BOLD)}everything, grouped by what it does")
+        print()
+        return 2
+
+    args = parser.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        sys.stdout.write(format_grouped_help())
+        return 0
+
     try:
         return args.func(args)
     except KeyboardInterrupt:
