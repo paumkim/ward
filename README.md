@@ -303,12 +303,26 @@ default-deny wall. Prefer binding a service to `127.0.0.1` over opening a port.
 
 ## Cost
 
-A warm scan takes about 0.3s. The expensive rules answer "how is this machine
-configured", which changes on a human timescale, so they are cached for
-`detect.external_interval_seconds` rather than re-run every cycle. Firewall and
-D-Bus queries are the reason this matters: `firewall-cmd` took 8.02s per call
-here, which made each cycle longer than its own interval and left the daemon
-permanently behind at 15% CPU.
+Measured on this host, not estimated:
+
+| | before | after |
+|---|---|---|
+| warm scan | 6.22s | 0.26s |
+| steady-state CPU | 15.4% of a core | under 1% |
+| scan interval | 3s | 10s |
+
+Three things got it there. `firewall-cmd` was being run every cycle, and its
+D-Bus round trip took 8.02s on its own, longer than the whole interval. Rules
+that answer "how is this machine configured" are now cached for
+`detect.external_interval_seconds`. And the default interval went from 3s to
+10s, which is where most of the CPU saving came from: a scan costs 0.26s, so
+running it every 3s is 8.5% of a core forever.
+
+The interval change costs almost nothing in detection latency. The tripwire runs
+every 60s regardless, and R05 needs two consecutive samples before it
+corroborates, so it was never going to fire inside three seconds. Set
+`detect.interval_seconds` back to 3.0 if you want the tighter loop and can pay
+for it.
 
 ## Licence
 

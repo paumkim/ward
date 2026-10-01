@@ -773,7 +773,7 @@ def run(verbose: bool = True, quick: bool = False) -> int:
             every cycle, which took 8.02s against a 3s interval. The daemon
             ran permanently behind and burned 15% CPU for nothing.
             """
-            cfg = _cfg(detect__interval_seconds=3.0)
+            cfg = _cfg()   # real default, so the budget tracks the shipped value
             cache: dict[str, Any] = {}
             detect.scan(cfg, host_bytes=None, do_integrity=False, cache=cache)
             warm = []

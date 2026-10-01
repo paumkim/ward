@@ -18,7 +18,7 @@ quarantine_sysctl_files = true
 llmnr = false
 
 [detect]
-interval_seconds = 3.0
+interval_seconds = 10.0
 integrity_interval_seconds = 900.0
 fanout_conn_threshold = 60
 fanout_distinct_ip_threshold = 25

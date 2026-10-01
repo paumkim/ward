@@ -61,7 +61,12 @@ DEFAULTS: dict[str, Any] = {
         "llmnr": False,  # systemd-resolved LLMNR=no
     },
     "detect": {
-        "interval_seconds": 3.0,
+        # 10s, not 3s. A warm scan costs 0.26s, so a 3s interval is 8.5% of a
+        # core forever, which is not an acceptable background cost on a laptop.
+        # Detection latency does not get meaningfully worse: the tripwire runs
+        # every 60s regardless, and R05 needs two samples to corroborate, so it
+        # was never going to fire inside 3s.
+        "interval_seconds": 10.0,
         # Subprocess-backed rules (firewall-cmd) and journal reads are cached
         # for this long. They answer "what is the machine configured like",
         # which changes on a human timescale, not a 3-second one.
