@@ -20,7 +20,7 @@ sudo ./install.sh
 
 sudo ward harden             # sysctl, LLMNR, sshd pinning, firewalld ports
 sudo ward firewall --apply   # default-deny inbound, no transit forwarding
-sudo ward selftest           # 68 checks: detection, safety, performance, hygiene
+sudo ward selftest           # 70 checks: detection, safety, performance, hygiene
 ward status                  # current verdict
 ```
 
@@ -219,7 +219,7 @@ Everything runs on `127.0.0.1`, so the test never puts a working proxy on a real
 interface.
 
 ```
-68/68 passed
+70/70 passed
 ```
 
 Roughly a quarter of the codebase is tests. Two of those checks are worth
@@ -249,7 +249,7 @@ self-test asserts the fallback set stays empty.
 ## Commands
 
 ```
-ward status              one-shot verdict
+ward status              one-shot verdict (safe to run without sudo)
 ward scan [--json]       full finding list
 ward watch               live loop, foreground
 ward daemon              supervised background loop
@@ -292,6 +292,10 @@ default-deny wall. Prefer binding a service to `127.0.0.1` over opening a port.
 
 - It will not kill anything in `observe` mode, and it will not touch anything
   in `signatures.PROTECTED_EXES` regardless of evidence.
+- If the daemon stops working, `ward status` says so instead of showing the last
+  good score. A broken defender that reports "no findings" is worse than no
+  defender, so the daemon publishes its own health and status refuses to render
+  a clean verdict when the heartbeat is stale or a cycle is failing.
 - It cannot stop a remote host using this machine as a plain internet gateway
   with no local listener. Nothing listening means nothing to observe. The
   forwarding rules close the kernel-level routes. Software-level, that case is

@@ -116,27 +116,54 @@ def print_status(config, verdict: detect.Verdict) -> None:
         host = observe.observe_host()
     except Exception:
         host = None
+    # The daemon publishes its own health and what it observed. Read it first:
+    # a broken daemon reporting "no findings" is the worst failure mode here.
+    published = _load_json(config.get("daemon.state", "/run/ward/state.json"))
+    if not isinstance(published, dict):
+        published = {}
     st = util.read_text(config.get("daemon.heartbeat", HEARTBEAT)).strip()
     hb = "no daemon heartbeat"
+    hb_ts = 0.0
     if st:
         parts = st.split()
         if len(parts) >= 3:
             try:
-                hb = f"{util.ago(float(parts[0]))}, pid {parts[1]}, score {parts[2]}"
+                hb_ts = float(parts[0])
+                hb = f"{util.ago(hb_ts)}, pid {parts[1]}, score {parts[2]}"
             except ValueError:
                 hb = st
     print()
     print(c("  WARD", BOLD) + c("  residential-proxy defence", DIM))
     print(c("  " + "\u2500" * 66, DIM))
     tag = c(f"{verdict.score}", score_colour(verdict.score))
-    print(row("risk score", f"{tag} / 100   {sev_tag(verdict.severity)}"))
+    # A broken daemon reporting "no findings" is the worst failure mode of a
+    # defender: it looks like an all-clear. Check the daemon's own health
+    # before presenting a score.
+    errors = published.get("cycle_errors") if isinstance(published, dict) else None
+    last_ok = published.get("last_ok") if isinstance(published, dict) else None
+    stale = False
+    if isinstance(last_ok, (int, float)) and last_ok:
+        interval = float(config.get("detect.interval_seconds", 10.0))
+        stale = (now() - last_ok) > interval * 4
+    if errors:
+        tag = c(str(verdict.score), RED)
+        print(row("risk score", f"{tag} / 100   {c('DEFENDER BROKEN', RED)}"))
+        print(row("", c(f"the daemon has failed {errors} cycle(s) in a row. "
+                         f"this score is the last good one, not a current reading.", RED)))
+        print(row("", c("sudo ward events --limit 5   to see the error", DIM)))
+        print()
+    elif stale or not hb_ts:
+        print(row("risk score", c("unknown", RED) + c("   the daemon is not reporting.", DIM)))
+        print(row("", c("sudo ward status   to scan on demand", DIM)))
+        print()
+    else:
+        print(row("risk score", f"{tag} / 100   {sev_tag(verdict.severity)}"))
     print(row("mode", str(config.get("respond.mode"))))
     # Reading nftables needs CAP_NET_ADMIN, so a user cannot see the table
     # directly. The daemon can, and publishes what it saw. Prefer the live read,
     # fall back to the daemon's observation, and say how old it is. Never guess:
     # reporting "ABSENT" from an unread ruleset would send the operator off to
     # re-apply a firewall that is working.
-    published = _load_json(config.get("daemon.state", "/run/ward/state.json"))
     observed = published.get("host") if isinstance(published, dict) else None
     live = host.nft_table_present if host else None
     if live is True:

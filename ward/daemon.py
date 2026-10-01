@@ -40,6 +40,10 @@ class Runtime:
     #: daemon runs as root and can read netlink; a user running `ward status`
     #: cannot, so this is published into the world-readable state file for it.
     last_host: dict[str, Any] = field(default_factory=dict)
+    #: Consecutive cycles that raised. A defender that has stopped working must
+    #: never present a clean verdict, so this is published and surfaced.
+    cycle_errors: int = 0
+    last_ok_ts: float = 0.0
     self_check_cycle: int = 0
     running: bool = True
     start_ts: float = field(default_factory=now)
@@ -130,6 +134,8 @@ class Runtime:
                         "log_seq": self.log.seq,
                         "dropped_events": self.log.dropped,
                         "host": self.last_host,
+                        "cycle_errors": self.cycle_errors,
+                        "last_ok": self.last_ok_ts or None,
                     }
                 ),
                 0o644,
@@ -284,8 +290,6 @@ class Runtime:
         )
         if do_integrity:
             self.last_integrity = now()
-            from . import observe
-
             self.save_integrity(
                 {
                     "files": observe.hash_manifest(
@@ -338,6 +342,8 @@ class Runtime:
 
         res = respond.respond(self.config, verdict, log=self.log)
         self.state_response = res
+        self.cycle_errors = 0
+        self.last_ok_ts = now()
 
         self.write_state()
         self.beat()
@@ -376,11 +382,19 @@ class Runtime:
             try:
                 self.cycle()
             except Exception as exc:  # never let one bad cycle kill the daemon
+                self.cycle_errors += 1
                 self.log.emit(
                     "error",
-                    {"err": repr(exc), "type": type(exc).__name__},
+                    {"err": repr(exc), "type": type(exc).__name__,
+                     "consecutive": self.cycle_errors},
                     title="scan cycle raised",
                 )
+                if self.cycle_errors in (1, 5, 60):
+                    # Publishing state on the error path is what lets `ward
+                    # status` say the defender is broken instead of showing the
+                    # last good score as if it were current.
+                    self.write_state()
+                    self.beat()
             cycles += 1
             if max_cycles and cycles >= max_cycles:
                 break

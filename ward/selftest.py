@@ -101,6 +101,39 @@ class Suite:
         return 1 if failed else 0
 
 
+def _log(tmpdir: str) -> Any:
+    from .events import EventLog
+
+    return EventLog(os.path.join(tmpdir, "events.jsonl"), mode="plain")
+
+
+def _status_lines(state: dict, cfg: Config) -> list[str]:
+    """Run print_status against a doctored daemon state file and capture it."""
+    import io
+    import contextlib
+    from . import cli as cli_mod
+
+    state_file = cfg.get("daemon.state")
+    saved = util.read_text(state_file) if os.path.isfile(state_file) else None
+    with open(state_file, "w") as fh:
+        json.dump(state, fh)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            cli_mod.print_status(cfg, detect.Verdict(
+                score=0, severity="info", findings=[], reasons=[]))
+    finally:
+        if saved is None:
+            try:
+                os.remove(state_file)
+            except OSError:
+                pass
+        else:
+            with open(state_file, "w") as fh:
+                fh.write(saved)
+    return buf.getvalue().splitlines()
+
+
 def _cfg(**over: Any) -> Config:
     data = {k: dict(v) if isinstance(v, dict) else v for k, v in DEFAULTS.items()}
     for dotted, value in over.items():
@@ -669,6 +702,75 @@ def run(verbose: bool = True, quick: bool = False) -> int:
 
         suite.check("SAFETY: sub-threshold signatures corroborate instead of dying",
                     t_no_dead_signatures)
+
+        def t_broken_daemon_never_reports_clean():
+            """A defender that has stopped working must not look like an all-clear.
+
+            Found live: a function-scoping bug made every scan cycle raise, and
+            `ward status` still printed "0/100 no findings". Silent failure
+            presented as safety is the worst outcome this tool can produce.
+            """
+            from .daemon import Runtime
+
+            tmp2 = tempfile.mkdtemp(prefix="ward-health-")
+            hb = os.path.join(tmp2, "heartbeat")
+            cfg = _cfg(
+                daemon__heartbeat=hb,
+                daemon__state=os.path.join(tmp2, "state.json"),
+                daemon__self_hashes=os.path.join(tmp2, "self.json"),
+                daemon__integrity_state=os.path.join(tmp2, "integrity.json"),
+                detect__process_cwd=tmp2,
+            )
+            rt = Runtime(config=cfg, log=_log(tmp2))
+            rt.log.path = os.path.join(tmp2, "log.jsonl")
+
+            def boom(*a, **kw):
+                raise RuntimeError("simulated cycle failure")
+
+            # Drive the real path: the error handler lives in run(), not cycle().
+            real = detect.scan
+            detect.scan = boom
+            try:
+                rt.run(max_cycles=2)
+            finally:
+                detect.scan = real
+            assert rt.cycle_errors == 2, rt.cycle_errors
+            state = json.loads(util.read_text(cfg.get("daemon.state")))
+            # State is republished on the 1st, 5th and 60th failing cycle rather
+            # than every one, so a permanently broken daemon does not rewrite
+            # the file forever. One recorded failure is enough to surface it.
+            assert state.get("cycle_errors", 0) >= 1, state
+            assert state.get("last_ok") is None, state
+            # the heartbeat still moved, so "is it running" is not the question;
+            # "is it working" is, and that is what cycle_errors answers.
+            assert os.path.isfile(hb), "no heartbeat written on the error path"
+
+            # a healthy cycle clears the counter
+            rt.cycle()
+            assert rt.cycle_errors == 0, rt.cycle_errors
+            state = json.loads(util.read_text(cfg.get("daemon.state")))
+            assert state.get("cycle_errors") == 0, state
+            assert state.get("last_ok"), state
+
+            # and status must refuse to print a score when the daemon is unhealthy
+            healthy = dict(state)
+            healthy["cycle_errors"] = 7
+            broken_status = _status_lines(healthy, cfg)
+            joined = "\n".join(broken_status)
+            assert "DEFENDER BROKEN" in joined, joined
+            assert "last good one" in joined, joined
+
+            stale = dict(state)
+            stale["last_ok"] = now() - (float(cfg.get("detect.interval_seconds")) * 5)
+            stale_status = "\n".join(_status_lines(stale, cfg))
+            assert "unknown" in stale_status, stale_status
+            assert "not reporting" in stale_status, stale_status
+
+            shutil.rmtree(tmp2, ignore_errors=True)
+            return True, "cycle errors counted, cleared on recovery, surfaced in status"
+
+        suite.check("SAFETY: a broken daemon never presents a clean score",
+                    t_broken_daemon_never_reports_clean)
 
         def t_vendor_word_in_prose_is_not_evidence():
             """A vendor word in a shell's argument list is text, not evidence.
