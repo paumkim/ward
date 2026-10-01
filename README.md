@@ -20,7 +20,7 @@ sudo ./install.sh
 
 sudo ward harden             # sysctl, LLMNR, sshd pinning, firewalld ports
 sudo ward firewall --apply   # default-deny inbound, no transit forwarding
-sudo ward selftest           # 73 checks: detection, safety, performance, hygiene
+sudo ward selftest           # 74 checks: detection, safety, performance, hygiene
 ward status                  # current verdict
 ```
 
@@ -194,7 +194,12 @@ original is executable again.
 
 **The tripwire.** `ward-tripwire.timer` runs every minute from a unit the
 daemon cannot stop. If the heartbeat goes stale while lockdown is armed,
-containment is re-applied. Killing the daemon does not silence the defender.
+containment is re-applied.
+
+The timer uses `Wants=ward.service`, not `Requires=`. With `Requires`, stopping
+the daemon also stops the timer, so the tripwire could never notice the daemon
+being dead, which is the only thing it exists to do. It sat inactive for 33
+minutes for exactly that reason.
 
 ## The event log is tamper-evident
 
@@ -236,7 +241,7 @@ Everything runs on `127.0.0.1`, so the test never puts a working proxy on a real
 interface.
 
 ```
-73/73 passed
+74/74 passed
 ```
 
 Roughly a quarter of the codebase is tests. Two of the checks are worth knowing

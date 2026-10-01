@@ -1,6 +1,10 @@
 [Unit]
 Description=Run the WARD tripwire every minute
-Requires=ward.service
+# Wants, not Requires. With Requires, stopping ward.service also stops this
+# timer, so the tripwire could never notice the daemon being dead -- which is
+# the only thing it exists to do. It was inactive for 33 minutes for exactly
+# that reason, after a plain `systemctl restart ward.service`.
+Wants=ward.service
 After=ward.service
 
 [Timer]

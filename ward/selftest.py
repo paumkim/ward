@@ -772,6 +772,34 @@ def run(verbose: bool = True, quick: bool = False) -> int:
         suite.check("SAFETY: a broken daemon never presents a clean score",
                     t_broken_daemon_never_reports_clean)
 
+        def t_tripwire_survives_the_daemon_being_stopped():
+            """The dead-man switch must outlive the thing it watches.
+
+            The timer carried Requires=ward.service, so `systemctl restart
+            ward.service` also stopped the timer, and it stayed inactive. That
+            is the one situation the tripwire exists to catch.
+            """
+            import pathlib as _pl
+
+            here = _pl.Path(__file__).resolve().parent.parent
+            timer = (here / "systemd" / "ward-tripwire.timer")
+            if not timer.is_file():
+                src = "/etc/systemd/system/ward-tripwire.timer"
+                timer = _pl.Path(src) if _pl.Path(src).is_file() else None
+            if timer is None:
+                return True, "skipped: unit file not found"
+            text = timer.read_text()
+            assert "Requires=ward.service" not in text, (
+                "the tripwire timer Requires ward.service, so stopping the "
+                "daemon stops the tripwire too"
+            )
+            assert "Wants=ward.service" in text, "expected Wants=ward.service"
+            assert "After=ward.service" in text, "ordering is still wanted"
+            return True, "Wants=, not Requires=; the tripwire outlives the daemon"
+
+        suite.check("SAFETY: the tripwire survives the daemon being stopped",
+                    t_tripwire_survives_the_daemon_being_stopped)
+
         def t_vendor_word_in_prose_is_not_evidence():
             """A vendor word in a shell's argument list is text, not evidence.
 
