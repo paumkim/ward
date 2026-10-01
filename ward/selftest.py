@@ -670,6 +670,40 @@ def run(verbose: bool = True, quick: bool = False) -> int:
         suite.check("SAFETY: sub-threshold signatures corroborate instead of dying",
                     t_no_dead_signatures)
 
+        def t_vendor_word_in_prose_is_not_evidence():
+            """A vendor word in a shell's argument list is text, not evidence.
+
+            Found live on this host: a bash process whose command line held a
+            heredoc mentioning "residential-proxy" scored 80. Same class of bug
+            as the bare-word cmdline signatures.
+            """
+            shell = observe.Proc(pid=99994, ppid=1, uid=1000, exe="/usr/bin/bash",
+                                 exe_base="bash",
+                                 cmdline="bash -c # note: research residential-proxy vendors\n"
+                                         "grep -rn residential-proxy ~/notes")
+            v = detect.rule_vendor_text([shell], observe.observe_host())
+            assert not v or v[0].score < 40, (
+                f"prose in a shell scored {v[0].score}: "
+                f"{[f.to_dict() for f in v]}"
+            )
+            # but a vendor name in the executable path or environment is real
+            agent = observe.Proc(pid=99993, ppid=1, uid=1000,
+                                 exe="/opt/iproyal/iproyal-agent",
+                                 exe_base="iproyal-agent",
+                                 cmdline="iproyal-agent --serve 1080")
+            v2 = detect.rule_vendor_text([agent], observe.observe_host())
+            assert v2 and v2[0].score >= 70, (
+                f"a vendor agent in /opt scored too low: {[f.to_dict() for f in v2]}"
+            )
+            assert v2[0].detail["where"] == "structural", v2[0].detail
+            return True, (
+                f"shell prose {v[0].score if v else 'silent'} vs "
+                f"agent in /opt {v2[0].score}"
+            )
+
+        suite.check("SAFETY: a vendor word in a shell's arguments is not evidence",
+                    t_vendor_word_in_prose_is_not_evidence)
+
         def t_p2p_clients_not_targets():
             """A BitTorrent seeder is not a proxy.
 

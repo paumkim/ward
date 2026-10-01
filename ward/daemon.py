@@ -36,6 +36,10 @@ class Runtime:
     last_integrity: float = 0.0
     last_process_scan: float = 0.0
     last_prune: float = 0.0
+    #: What the last cycle observed about the firewall and forwarding. The
+    #: daemon runs as root and can read netlink; a user running `ward status`
+    #: cannot, so this is published into the world-readable state file for it.
+    last_host: dict[str, Any] = field(default_factory=dict)
     self_check_cycle: int = 0
     running: bool = True
     start_ts: float = field(default_factory=now)
@@ -125,6 +129,7 @@ class Runtime:
                         "log_head": self.log.head,
                         "log_seq": self.log.seq,
                         "dropped_events": self.log.dropped,
+                        "host": self.last_host,
                     }
                 ),
                 0o644,
@@ -296,6 +301,14 @@ class Runtime:
 
         prev_score = self.last_verdict.get("score", 0)
         self.last_verdict = verdict.to_dict()
+        host = observe.observe_host()
+        self.last_host = {
+            "checked": now(),
+            "firewall_table": host.nft_table_present,
+            "ip_forward": host.ip_forward,
+            "ipv6_forwarding": host.ipv6_forwarding,
+            "lan_iface": host.lan_iface,
+        }
 
         escalate = verdict.score >= self.config.get("respond.contain_score", 70)
         if escalate and prev_score < self.config.get("respond.contain_score", 70):

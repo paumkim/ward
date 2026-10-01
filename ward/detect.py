@@ -334,29 +334,65 @@ _HIGH_FANOUT_OK = {
 # ------------------------------------------------------------------ R06 relay cfg
 
 
+#: Processes whose command line is prose by nature. A shell running a heredoc,
+#: an editor holding a file, a grep with a search term: all of these contain
+#: whatever text the user is working with, so a vendor word in the argument list
+#: says nothing about them.
+PROSE_BEARING = {
+    "bash", "zsh", "fish", "sh", "dash", "ksh", "tmux", "screen",
+    "vim", "nvim", "vi", "emacs", "nano", "kak", "helix", "hx", "micro",
+    "grep", "egrep", "fgrep", "rg", "ripgrep", "ag", "ack", "sd",
+    "less", "more", "man", "cat", "bat", "tail", "head", "wc", "sort", "uniq",
+    "cut", "tr", "jq", "yq", "awk", "sed", "python3", "python", "node", "bun",
+    "deno", "ruby", "perl", "php", "opencode", "code", "term", "bash",
+}
+
+
 def rule_vendor_text(procs: list[Proc], host: observe.HostState) -> list[Finding]:
-    """R06: residential-proxy vendor strings in env, cmdline or cwd."""
+    """R06: residential-proxy vendor strings, weighted by where they appear.
+
+    Found live on this host: a `bash` process whose command line contained a
+    heredoc mentioning "residential-proxy" scored 80. The word was in the
+    user's own script text, not in anything the process was doing.
+
+    So the location decides the score. A vendor name in an executable path, a
+    working directory or the environment is structural evidence. A vendor name
+    in the argument list of a shell or editor is just text someone typed.
+    """
     out: list[Finding] = []
     for proc in procs:
-        blob = " ".join(
-            [proc.cmdline, proc.cwd, proc.exe, " ".join(f"{k}={v}" for k, v in proc.env.items())]
-        )
-        if not signatures.match_vendor_text(blob):
+        env_blob = " ".join(f"{k}={v}" for k, v in proc.env.items())
+        structural = " ".join([proc.exe, proc.cwd, env_blob])
+        cmd_blob = "" if proc.exe_base in PROSE_BEARING else proc.cmdline
+        structural_hit = signatures.match_vendor_text(structural)
+        cmd_hit = signatures.match_vendor_text(cmd_blob) if cmd_blob else None
+        if not (structural_hit or cmd_hit):
             continue
-        found = sorted(
-            {
-                m.group(0).lower()
-                for m in signatures.VENDOR_TEXT_RX.finditer(blob)
-            }
-        )[:8]
+        if structural_hit and cmd_hit:
+            score, why = 85, "vendor reference in both the invocation and its environment"
+        elif structural_hit:
+            # A shell's cwd or environment naming a vendor directory is real.
+            score, why = 70, "vendor reference in the executable path, cwd or environment"
+        else:
+            score, why = 20, "vendor word in the argument list; treated as prose, not evidence"
+        where = " ".join(filter(None, [structural if structural_hit else "", cmd_blob if cmd_hit else ""]))
         out.append(
             Finding(
                 rule="R06-resi-vendor",
-                title=f"residential proxy vendor reference near {proc.exe_base} (pid {proc.pid})",
-                score=80,
-                severity="high",
-                detail={"vendors": found, "cmdline": util.truncate(proc.cmdline, 300),
-                        "cwd": proc.cwd},
+                title=(
+                    f"residential proxy vendor reference near {proc.exe_base} "
+                    f"(pid {proc.pid})"
+                ),
+                score=score,
+                severity=_sev(score),
+                detail={
+                    "vendors": sorted({m.group(0).lower() for m in
+                                       signatures.VENDOR_TEXT_RX.finditer(where)})[:8],
+                    "where": ("structural" if structural_hit else "cmdline only"),
+                    "why": why,
+                    "cmdline": util.truncate(proc.cmdline, 240),
+                    "cwd": proc.cwd,
+                },
                 subjects=[{"pid": proc.pid}],
             )
         )

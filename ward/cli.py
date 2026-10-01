@@ -75,7 +75,17 @@ def score_colour(score: int) -> str:
 
 
 def sev_tag(sev: str) -> str:
-    return c(sev.upper().ljust(8), sev_colour(sev))
+    """Severity, padded only when colour is on (padding is invisible anyway)."""
+    label = sev.upper()
+    return c(label.ljust(8), sev_colour(sev)) if _TTY else label
+
+
+#: Label column width, after the two-space indent. Every value starts here.
+LABEL_W = 12
+
+
+def row(label: str, value: str) -> str:
+    return f"  {c(label.ljust(LABEL_W), DIM)}{value}"
 
 
 # ------------------------------------------------------------------ helpers
@@ -118,38 +128,57 @@ def print_status(config, verdict: detect.Verdict) -> None:
     print()
     print(c("  WARD", BOLD) + c("  residential-proxy defence", DIM))
     print(c("  " + "\u2500" * 66, DIM))
-    tag = c(f"{verdict.score:>3}", score_colour(verdict.score))
-    print(f"  risk score   {tag} / 100   {sev_tag(verdict.severity)}")
-    print(f"  mode         {config.get('respond.mode')}")
-    if host is None:
-        fw_state = "unknown"
-    elif host.nft_table_present is True:
+    tag = c(f"{verdict.score}", score_colour(verdict.score))
+    print(row("risk score", f"{tag} / 100   {sev_tag(verdict.severity)}"))
+    print(row("mode", str(config.get("respond.mode"))))
+    # Reading nftables needs CAP_NET_ADMIN, so a user cannot see the table
+    # directly. The daemon can, and publishes what it saw. Prefer the live read,
+    # fall back to the daemon's observation, and say how old it is. Never guess:
+    # reporting "ABSENT" from an unread ruleset would send the operator off to
+    # re-apply a firewall that is working.
+    published = _load_json(config.get("daemon.state", "/run/ward/state.json"))
+    observed = published.get("host") if isinstance(published, dict) else None
+    live = host.nft_table_present if host else None
+    if live is True:
         fw_state = c("present", GREEN)
-    elif host.nft_table_present is False:
+    elif live is False:
         fw_state = c("ABSENT -- run: sudo ward firewall --apply", RED)
+    elif isinstance(observed, dict) and observed.get("firewall_table") is not None:
+        age = util.ago(float(observed.get("checked", 0)))
+        if observed["firewall_table"]:
+            fw_state = c(f"present", GREEN) + c(f" (as of {age}, via the daemon)", DIM)
+        else:
+            fw_state = c(f"ABSENT as of {age}", RED)
     else:
-        fw_state = c("unknown (reading nft needs root)", YELLOW)
-    print(f"  firewall     ward table {fw_state}")
-    print(f"  heartbeat    {hb}")
-    if host:
-        fwd = "0 (good)" if host.ip_forward == 0 else f"{host.ip_forward}  <-- this machine can route"
-        print(f"  ip_forward   {fwd}")
+        fw_state = c("unknown", YELLOW) + c(" -- no daemon observation; try sudo ward status", DIM)
+    print(row("firewall", f"ward table {fw_state}"))
+    print(row("heartbeat", hb))
+
+    fwd_value = host.ip_forward if host else (
+        observed.get("ip_forward") if isinstance(observed, dict) else None
+    )
+    if fwd_value is None:
+        fwd = c("unknown", YELLOW)
+    elif fwd_value == 0:
+        fwd = "0 (good)"
+    else:
+        fwd = c(f"{fwd_value}  <-- this machine can route", RED)
+    print(row("ip_forward", fwd))
     print()
     revoked = respond.quarantined_binaries()
     if revoked:
-        print(f"  revoked binaries  {c(str(len(revoked)), YELLOW)} "
-              f"(undo with: sudo ward release <pid>)")
+        print(row("revoked", f"{c(str(len(revoked)), YELLOW)} binary exec bits "
+                              f"removed  (undo: sudo ward release <pid>)"))
         for item in revoked[:5]:
             original = item["original"] or "original not found"
-            print(f"    {c(item['quarantined'].rsplit('/', 1)[-1], DIM)}"
-                  f"  <- {original}  exec="
-                  f"{'yes' if item['original'] and os.access(item['original'], os.X_OK) else c('NO', RED)}")
+            ok = item["original"] and os.access(item["original"], os.X_OK)
+            print("    " + c(item["quarantined"].rsplit("/", 1)[-1].ljust(28), DIM)
+                  + f"{original}  exec={'yes' if ok else c('NO', RED)}")
     if verdict.findings:
         print(c("  findings", BOLD))
         for f in verdict.findings[:12]:
-            print(f"    {sev_tag(f.severity)} {c(f.score, score_colour(f.score)):>3}  "
-                  f"{c(f.rule, DIM)}")
-            print(f"             {f.title}")
+            print(f"    {sev_tag(f.severity)} {c(str(f.score).rjust(3), score_colour(f.score))}  "
+                  f"{c(f.rule.ljust(26), DIM)}{f.title}")
         if len(verdict.findings) > 12:
             print(c(f"    ... and {len(verdict.findings) - 12} more", DIM))
     else:
