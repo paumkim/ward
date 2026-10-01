@@ -135,6 +135,15 @@ def print_status(config, verdict: detect.Verdict) -> None:
         fwd = "0 (good)" if host.ip_forward == 0 else f"{host.ip_forward}  <-- this machine can route"
         print(f"  ip_forward   {fwd}")
     print()
+    revoked = respond.quarantined_binaries()
+    if revoked:
+        print(f"  revoked binaries  {c(str(len(revoked)), YELLOW)} "
+              f"(undo with: sudo ward release <pid>)")
+        for item in revoked[:5]:
+            original = item["original"] or "original not found"
+            print(f"    {c(item['quarantined'].rsplit('/', 1)[-1], DIM)}"
+                  f"  <- {original}  exec="
+                  f"{'yes' if item['original'] and os.access(item['original'], os.X_OK) else c('NO', RED)}")
     if verdict.findings:
         print(c("  findings", BOLD))
         for f in verdict.findings[:12]:
@@ -316,6 +325,57 @@ def cmd_counters(args) -> int:
     for key, value in sorted(counts.items()):
         print(f"  {key:<22} {value:>12,}")
     return 0
+
+
+def cmd_seal(args) -> int:
+    """Record hashes of WARD's own files.
+
+    Called by install.sh. Without it the first daemon start writes the
+    baseline itself, which means anything that modified WARD before that
+    first start is baked in as the expected state.
+    """
+    util.require_root("seal")
+    rt = make_runtime(_load(args))
+    n = rt.record_self()
+    if n < 0:
+        print(f"  {c('FAIL', RED)}  could not write {rt.self_hashes_path}")
+        print("        run it as root, and check that /var/lib/ward is writable")
+        return 1
+    print(f"  {c('ok', GREEN)}  sealed {n} file(s) -> {rt.self_hashes_path}")
+    print("        any later change to these raises a self-integrity finding")
+    return 0
+
+
+def cmd_unquarantine(args) -> int:
+    """Clear the port-quarantine table.
+
+    A containment action that drops a port can be wrong. This is the undo, and
+    it has to exist as a command rather than a function nobody can reach.
+    """
+    util.require_root("unquarantine")
+    ok, msg = firewall.unquarantine()
+    print(f"  {c('ok' if ok else 'FAIL', GREEN if ok else RED)}  {msg}")
+    return 0 if ok else 1
+
+
+def cmd_release(args) -> int:
+    """Unfreeze a process WARD contained, and give its binary back exec.
+
+    A false positive must be recoverable by a human without a reboot.
+    """
+    util.require_root("release")
+    pid = args.pid
+    ok1, msg1 = respond.unfreeze_cgroup(pid)
+    restored = "no binary was revoked for that pid"
+    try:
+        exe = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        exe = ""
+    if exe and not os.access(exe, os.X_OK):
+        ok2, restored = respond.restore_binary_exec(exe)
+    print(f"  {c('ok' if ok1 else 'warn', GREEN if ok1 else YELLOW)}  {msg1}")
+    print(f"        {restored}")
+    return 0 if ok1 else 1
 
 
 def cmd_lockdown(args) -> int:
@@ -653,6 +713,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-counters", action="store_true")
 
     add("counters", cmd_counters, "packet counters from the live table")
+
+    add("seal", cmd_seal, "record hashes of WARD's own files (install step)")
+
+    add("unquarantine", cmd_unquarantine,
+        "clear the port-quarantine table (undo a containment drop)")
+
+    sp = add("release", cmd_release, "unfreeze a contained process")
+    sp.add_argument("pid", type=int)
 
     sp = add("lockdown", cmd_lockdown, "maximum containment")
     sp.add_argument("--yes", action="store_true")

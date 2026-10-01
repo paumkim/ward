@@ -307,9 +307,6 @@ class EventLog:
         """
         self._declared_records = max(0, int(n))
 
-    def note_write(self) -> None:
-        self._declared_records = self._seq
-
     def prune(self, keep_days: int) -> int:
         """Delete rotated files older than keep_days. Never touches the live log."""
         removed = 0

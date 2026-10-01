@@ -96,6 +96,10 @@ Scoring is additive but damped: the worst signal plus a decayed contribution
 from the rest. One 95 is not diluted by six 30s, and six 30s do not add up to
 95.
 
+Two independent signatures corroborate each other below the 80-point threshold,
+which is why a renamed `socat TCP-LISTEN:1080,fork,reuseaddr` still scores 85.
+A single signature below the threshold is not enough.
+
 **R03, network-reachable listener.** A proxy needs an inbound door, and a
 laptop has no business having one. A TCP listener on a non-loopback address
 scores 30. On a known relay port, 55. On `0.0.0.0` or `::`, another 15.
@@ -134,6 +138,10 @@ opinion. A packet capture is a fact.
 
 ## Containment
 
+Every mode name is validated. A typo in `respond.mode` falls back to
+`observe`, and `ward status` says so. WARD never does more than it was asked to
+do because of a spelling mistake.
+
 | Mode | Does |
 |------|------|
 | `observe` | Logs and alerts. Default. Never acts. |
@@ -154,6 +162,18 @@ the original. The running process keeps its mapped pages, so it stays visible in
 
 `auto_kill` and `auto_lockdown` ship disabled. Move to `contain` after your
 baseline is clean, then to `kill` once you have watched a few days of output.
+
+**Undo paths.** Every containment action has a command that reverses it, because
+a false positive must be recoverable by a human without a reboot:
+
+```
+ward unquarantine          clear the port-quarantine table
+ward release PID           unfreeze a process and restore its exec bit
+ward kill PID --no-evidence   skip the snapshot, just kill
+```
+
+`ward status` lists every binary whose exec bit has been revoked and whether the
+original is executable again.
 
 **The tripwire.** `ward-tripwire.timer` runs every minute from a unit the
 daemon cannot stop. If the heartbeat goes stale while lockdown is armed,
@@ -199,8 +219,16 @@ Everything runs on `127.0.0.1`, so the test never puts a working proxy on a real
 interface.
 
 ```
-52/52 passed
+68/68 passed
 ```
+
+Roughly a quarter of the codebase is tests. Two of those checks are worth
+naming: one runs a full scan after every fixture is torn down and requires an
+idle machine to score zero, and one walks the source for functions and config
+keys that nothing references. The second exists because 14 dead functions and
+21 unread config knobs had accumulated. A knob nothing reads is worse than no
+knob, because an operator reads `relay_mbps_threshold` and believes it does
+something.
 
 ## A note on detection patterns
 
@@ -239,6 +267,9 @@ ward baseline [--reset]  learn or show the known-good inventory
 ward tripwire            check the daemon heartbeat
 ward explain R05         why a rule exists
 ward selftest            prove the detector fires
+ward unquarantine        undo a containment port drop
+ward release PID         unfreeze a process, restore its exec bit
+ward seal                record hashes of WARD's own files
 ```
 
 Exit code is 0 below score 70 and 1 at or above, so `ward status` works as a
@@ -251,7 +282,8 @@ overrides use `WARD_` with `__` for nesting, such as
 `WARD_RESPOND__MODE=contain`.
 
 Defaults are strict. Every knob exists so you can loosen one specific thing
-without weakening the rest.
+without weakening the rest. A knob that nothing reads is deleted rather than
+documented, and the self-test fails if one comes back.
 
 One knob needs care: `firewall.lan_allowlist`. Every entry is a hole in the
 default-deny wall. Prefer binding a service to `127.0.0.1` over opening a port.
@@ -268,6 +300,15 @@ default-deny wall. Prefer binding a service to `127.0.0.1` over opening a port.
 - It watches a fixed list of paths for integrity. It is not a whole-system
   integrity checker.
 - Nothing here needs a cloud account, a phone-home, or a subscription.
+
+## Cost
+
+A warm scan takes about 0.3s. The expensive rules answer "how is this machine
+configured", which changes on a human timescale, so they are cached for
+`detect.external_interval_seconds` rather than re-run every cycle. Firewall and
+D-Bus queries are the reason this matters: `firewall-cmd` took 8.02s per call
+here, which made each cycle longer than its own interval and left the daemon
+permanently behind at 15% CPU.
 
 ## Licence
 

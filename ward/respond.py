@@ -221,13 +221,76 @@ def quarantine_cgroup(pid: int) -> tuple[bool, str]:
 
 
 def unfreeze_cgroup(pid: int) -> tuple[bool, str]:
+    """Release a process WARD froze. The manual undo for a false positive."""
     target = f"/sys/fs/cgroup/ward-quarantine/{pid}/cgroup.freeze"
     try:
         with open(target, "w") as fh:
             fh.write("0")
+    except FileNotFoundError:
+        return False, f"pid {pid} was never frozen"
     except OSError as exc:
         return False, str(exc)
     return True, f"pid {pid} unfrozen"
+
+
+def restore_binary_exec(path: str) -> tuple[bool, str]:
+    """Give a quarantined binary its execute bit back.
+
+    move_binary_to_quarantine() chmods the original to 000 and there was no
+    inverse anywhere in the codebase, so one false positive left a binary
+    permanently unexecutable with no documented way out.
+    """
+    if not os.path.isfile(path):
+        return False, f"{path} no longer exists"
+    try:
+        mode = os.stat(path).st_mode & 0o7777
+        if mode & 0o111:
+            return True, f"{path} is already executable ({oct(mode)})"
+        restored = mode | 0o755 & 0o7777
+        os.chmod(path, restored)
+        return True, f"{path} restored to {oct(restored)}"
+    except OSError as exc:
+        return False, str(exc)
+
+
+def quarantined_binaries() -> list[dict[str, Any]]:
+    """List quarantined binaries and whether their original is still present."""
+    out: list[dict[str, Any]] = []
+    base = "/var/lib/ward/quarantine/bin"
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return out
+    for name in names:
+        if name.endswith(".orig"):
+            continue
+        full = os.path.join(base, name)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        out.append({
+            "quarantined": full,
+            "size": st.st_size,
+            "sha256": util.sha256_file(full),
+            "original": _find_original(name),
+        })
+    return out
+
+
+def _find_original(name: str) -> str | None:
+    """Locate the binary a quarantined copy came from."""
+    qdir = "/var/lib/ward/quarantine"
+    # The copy is named <timestamp>-<basename>; match on the basename.
+    base = name.split("-", 1)[1] if "-" in name else name
+    for root in ("/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin",
+                 "/opt", "/home"):
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _d, files in os.walk(root):
+            if base in files:
+                return os.path.join(dirpath, base)
+    return None
 
 
 def move_binary_to_quarantine(config, pid: int) -> tuple[bool, str]:
@@ -242,7 +305,7 @@ def move_binary_to_quarantine(config, pid: int) -> tuple[bool, str]:
         exe = os.readlink(f"/proc/{pid}/exe")
     except OSError:
         return False, "cannot read exe"
-    qdir = config.get("respond.quarantine_dir", "/var/lib/ward/quarantine")
+    qdir = config.get("respond.quarantine_dir", "/var/lib/ward/quarantine/bin")
     util.ensure_dir(qdir, 0o700)
     copy = os.path.join(qdir, f"{time.strftime('%Y%m%dT%H%M%S')}-{os.path.basename(exe)}")
     try:

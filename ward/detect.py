@@ -62,6 +62,30 @@ def _sev(score: int) -> str:
     return "info"
 
 
+def finding(
+    rule: str,
+    title: str,
+    score: int,
+    detail: dict[str, Any] | None = None,
+    subjects: list[dict] | None = None,
+    severity: str | None = None,
+) -> Finding:
+    """Build a Finding, deriving severity from the score.
+
+    Every rule used to hand-write severity alongside score, which is _sev()
+    computed twice and a standing invitation to the two drifting apart. Pass
+    `severity` only to override, and only when the score is not the whole story.
+    """
+    return Finding(
+        rule=rule,
+        title=title,
+        score=score,
+        severity=severity or _sev(score),
+        detail=detail or {},
+        subjects=subjects or [],
+    )
+
+
 # ------------------------------------------------------------------ R01 exe
 
 
@@ -343,110 +367,86 @@ def rule_vendor_text(procs: list[Proc], host: observe.HostState) -> list[Finding
 
 
 def rule_forwarding(host: observe.HostState) -> list[Finding]:
-    """R07: routing/NAT capability.
+    """R07: routing and NAT capability.
 
-    IP forwarding plus a listener is exactly how a laptop gets turned into a
-    relay for a neighbour. Forwarding on its own is suspicious on a laptop.
+    IP forwarding plus a listener is how a laptop gets turned into a relay for
+    a neighbour. Forwarding on its own is already odd on a laptop.
     """
     out: list[Finding] = []
     if host.ip_forward == 1:
-        out.append(
-            Finding(
-                rule="R07-ip-forward",
-                title="net.ipv4.ip_forward=1 (this machine can route for others)",
-                score=45,
-                severity="medium",
-                detail={
-                    "ip_forward": host.ip_forward,
-                    "sysctl_sources": host.sysctl_sources,
-                    "note": "laptops and desktops have no legitimate need to forward",
-                },
-                subjects=[{"sysctl": "net.ipv4.ip_forward"}],
-            )
-        )
+        out.append(finding(
+            "R07-ip-forward",
+            "net.ipv4.ip_forward=1 (this machine can route for others)",
+            45,
+            {"ip_forward": host.ip_forward,
+             "sysctl_sources": host.sysctl_sources,
+             "note": "laptops and desktops have no legitimate need to forward"},
+            [{"sysctl": "net.ipv4.ip_forward"}],
+        ))
     if host.ipv6_forwarding == 1:
-        out.append(
-            Finding(
-                rule="R07-ipv6-forward",
-                title="net.ipv6.conf.all.forwarding=1",
-                score=35,
-                severity="low",
-                detail={"sources": host.sysctl_sources},
-                subjects=[{"sysctl": "net.ipv6.conf.all.forwarding"}],
-            )
-        )
+        out.append(finding(
+            "R07-ipv6-forward",
+            "net.ipv6.conf.all.forwarding=1",
+            35,
+            {"sources": host.sysctl_sources},
+            [{"sysctl": "net.ipv6.conf.all.forwarding"}],
+        ))
     if host.masquerade_rules:
-        # Scored low on purpose. Docker, Podman and libvirt all create
-        # masquerade rules, so a 55 here put every container host permanently
-        # in the high band with nothing the operator could do about it.
-        # Masquerade becomes evidence only next to forwarding.
-        out.append(
-            Finding(
-                rule="R07-masquerade",
-                title=f"{host.masquerade_rules} NAT masquerade rule(s) present",
-                score=20 if host.ip_forward == 0 else 40,
-                severity="low" if host.ip_forward == 0 else "medium",
-                detail={
-                    "count": host.masquerade_rules,
-                    "ip_forward": host.ip_forward,
-                    "why": "normal on a Docker/VM host; only meaningful "
-                           "together with ip_forward=1",
-                    "note": "counted as a raw substring across the whole "
-                            "ruleset, so this is a presence indicator, not an "
-                            "inventory of NAT rules",
-                },
-                subjects=[{"nft": "masquerade"}],
-            )
-        )
+        # Low on purpose. Docker, Podman and libvirt all create masquerade
+        # rules, so a high score here put every container host permanently in
+        # the top band with nothing the operator could do about it.
+        # Masquerade is evidence only next to forwarding.
+        paired = host.ip_forward != 0
+        out.append(finding(
+            "R07-masquerade",
+            f"{host.masquerade_rules} NAT masquerade rule(s) present",
+            40 if paired else 20,
+            {"count": host.masquerade_rules,
+             "ip_forward": host.ip_forward,
+             "why": "normal on a Docker/VM host; only meaningful together "
+                    "with ip_forward=1",
+             "note": "counted as a raw substring over the whole ruleset, so "
+                     "this is a presence indicator, not an inventory"},
+            [{"nft": "masquerade"}],
+        ))
     if host.forward_chains:
-        effective = host.forward_chains[0][1]
-        governing = host.forward_chains[0]
-        if effective == "accept":
-            out.append(
-                Finding(
-                    rule="R07-forward-accept",
-                    title=(
-                        f"forwarded traffic is permitted: the first forward chain in "
-                        f"priority order ({governing[2]}, priority {governing[0]}) "
-                        f"has policy accept"
-                    ),
-                    score=40,
-                    severity="medium",
-                    detail={
-                        "effective_policy": effective,
-                        "governing_chain": governing[2],
-                        "governing_priority": governing[0],
-                        "all_forward_chains": [
-                            {"chain": n, "priority": p, "policy": pol}
-                            for p, pol, n in host.forward_chains
-                        ],
-                        "why": "a machine that forwards is a relay for its neighbours",
-                    },
-                    subjects=[{"nft": "forward"}],
-                )
-            )
+        # Only the first base chain in priority order governs: it either drops
+        # the packet or lets it through to the next one. Reporting firewalld's
+        # policy-accept chain while our own table already dropped the packet is
+        # true and useless.
+        prio, policy, name = host.forward_chains[0]
+        if policy == "accept":
+            out.append(finding(
+                "R07-forward-accept",
+                f"forwarded traffic is permitted: the first forward chain in "
+                f"priority order ({name}, priority {prio}) has policy accept",
+                40,
+                {"effective_policy": policy,
+                 "governing_chain": name,
+                 "governing_priority": prio,
+                 "all_forward_chains": [
+                     {"chain": n, "priority": p, "policy": pol}
+                     for p, pol, n in host.forward_chains
+                 ],
+                 "why": "a machine that forwards is a relay for its neighbours"},
+                [{"nft": "forward"}],
+            ))
     elif host.forward_accept_rules:
-        out.append(
-            Finding(
-                rule="R07-forward-accept",
-                title="forwarded traffic is permitted by the host firewall",
-                score=40,
-                severity="medium",
-                detail={"accept_chains": host.forward_accept_rules},
-                subjects=[{"nft": "forward"}],
-            )
-        )
+        out.append(finding(
+            "R07-forward-accept",
+            "forwarded traffic is permitted by the host firewall",
+            40,
+            {"accept_chains": host.forward_accept_rules},
+            [{"nft": "forward"}],
+        ))
     if host.send_redirects == 1:
-        out.append(
-            Finding(
-                rule="R07-icmp-redirect",
-                title="ICMP send_redirects enabled (MITM lever on a LAN)",
-                score=25,
-                severity="low",
-                detail={},
-                subjects=[{"sysctl": "net.ipv4.conf.all.send_redirects"}],
-            )
-        )
+        out.append(finding(
+            "R07-icmp-redirect",
+            "ICMP send_redirects enabled (MITM lever on a LAN)",
+            25,
+            {"send_redirects": 1},
+            [{"sysctl": "net.ipv4.conf.all.send_redirects"}],
+        ))
     return out
 
 
@@ -728,33 +728,52 @@ def rule_obfuscation(procs: list[Proc]) -> list[Finding]:
 # ------------------------------------------------------------------ R13 exposure
 
 
-def rule_port_exposure(config) -> list[Finding]:
-    """R13: the host firewall leaves non-essential inbound ports open."""
+def rule_port_exposure(config, cache: dict[str, Any] | None = None) -> list[Finding]:
+    """R13: the host firewall leaves non-essential inbound ports open.
+
+    `firewall-cmd` is a D-Bus round trip that took 8.02s per call on this
+    host. Running it every 3s cycle made a scan take longer than its own
+    interval, which is how the daemon ended up permanently behind and burning
+    15% CPU. A firewall zone does not change between scans, so the answer is
+    cached for `detect.external_interval_seconds`.
+    """
     out: list[Finding] = []
     import shutil
 
-    if shutil.which("firewall-cmd"):
-        rc, out_txt, _ = util.run(["firewall-cmd", "--list-ports"], timeout=8)
-        if rc == 0:
-            for entry in out_txt.split():
-                port_txt = entry.split("/")[0]
-                try:
-                    port = int(port_txt)
-                except ValueError:
-                    continue
-                if port in signatures.RELAY_PORTS or port in (22, 23, 445, 3389, 5900):
-                    score = 50 if port in signatures.RELAY_PORTS else 35
-                    out.append(
-                        Finding(
-                            rule="R13-firewall-open-port",
-                            title=f"firewalld publicly opens {entry}",
-                            score=score,
-                            severity="medium",
-                            detail={"port": port, "entry": entry,
-                                    "note": "an open port on the firewall is open to the world"},
-                            subjects=[{"port": port}],
-                        )
+    if not shutil.which("firewall-cmd"):
+        return out
+    ttl = float(config.get("detect.external_interval_seconds", 300))
+    if cache is not None:
+        cached = cache.get("port_exposure")
+        if cached and now() - cached[0] < ttl:
+            return cached[1]
+    rc, out_txt, _ = util.run(
+        ["firewall-cmd", "--zone=public", "--list-ports"], timeout=15
+    )
+    if rc == 0:
+        for entry in out_txt.split():
+            port_txt = entry.split("/")[0]
+            try:
+                port = int(port_txt)
+            except ValueError:
+                continue
+            if port in signatures.RELAY_PORTS or port in (22, 23, 445, 3389, 5900):
+                score = 50 if port in signatures.RELAY_PORTS else 35
+                out.append(
+                    Finding(
+                        rule="R13-firewall-open-port",
+                        title=f"firewalld publicly opens {entry}",
+                        score=score,
+                        severity="medium",
+                        detail={"port": port, "entry": entry,
+                                "zone": "public",
+                                "note": "an open port on the firewall is open "
+                                        "to the world"},
+                        subjects=[{"port": port}],
                     )
+                )
+    if cache is not None:
+        cache["port_exposure"] = (now(), out)
     return out
 
 
@@ -822,12 +841,14 @@ def scan(
     stored_integrity: dict[str, Any] | None = None,
     host_bytes: dict[str, int] | None = None,
     do_integrity: bool = True,
-    full: bool = False,
+    cache: dict[str, Any] | None = None,
 ) -> Verdict:
     """Run every rule and reduce to one verdict."""
     history = history if history is not None else {}
     listeners, conns = observe.observe_sockets()
-    procs = observe.observe_processes(include_content_scan=True)
+    procs = observe.observe_processes(
+        include_content_scan=True, sockets=(listeners, conns)
+    )
     host = observe.observe_host()
 
     allow_lan = {
@@ -847,7 +868,7 @@ def scan(
     findings += rule_tor(listeners, host)
     findings += rule_relay_infra(host)
     findings += rule_obfuscation(procs)
-    findings += rule_port_exposure(config)
+    findings += rule_port_exposure(config, cache)
     if host_bytes:
         findings += rule_asymmetry(host_bytes, procs)
 

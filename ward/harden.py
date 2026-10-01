@@ -22,7 +22,7 @@ from .util import now, run
 
 SYSCTL_DIR = "/etc/sysctl.d"
 WARD_SYSCTL = f"{SYSCTL_DIR}/99-ward-hardening.conf"
-QUARANTINE_DIR = "/var/lib/ward/quarantine"
+QUARANTINE_DIR = "/var/lib/ward/quarantine/sysctl"
 
 #: Written once, applied by systemd-sysctl on every boot.
 HARDENING_CONF = """\

@@ -185,7 +185,8 @@ class Runtime:
             except OSError:
                 pass
 
-    def record_self(self) -> None:
+    def record_self(self) -> int:
+        """Record hashes of our own files. Returns the count, or -1 on failure."""
         import json
 
         here = os.path.dirname(os.path.abspath(__file__))
@@ -201,8 +202,14 @@ class Runtime:
             util.atomic_write(
                 self.self_hashes_path, json.dumps(current, indent=1), 0o600
             )
-        except OSError:
-            pass
+            return len(current)
+        except OSError as exc:
+            self.log.emit(
+                "error",
+                {"what": "could not record self-hashes", "err": str(exc)},
+                title="seal failed",
+            )
+            return -1
 
     # ------------------------------------------------------------ baseline
 

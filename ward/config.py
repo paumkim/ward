@@ -30,14 +30,12 @@ DEFAULTS: dict[str, Any] = {
         # non-loopback address on these is reachable by third parties.
         "lan_ifaces": ["wlan0", "eth0", "enp0s31f6", "wlp2s0"],
         "trusted_lan_cidr": "192.168.0.0/16",
-        "admin_user": "",  # optional; set to your own login for reports
     },
     "firewall": {
         # WARD owns its own nft table. firewalld may keep running; we insert a
         # stricter table at a lower hook priority so we are evaluated first.
         "table": "ward",
         "family": "inet",
-        "apply": True,
         "default_input": "drop",
         "default_forward": "drop",  # no transit, ever
         "default_output": "accept",
@@ -57,39 +55,23 @@ DEFAULTS: dict[str, Any] = {
     },
     "harden": {
         "ip_forward": False,  # set net.ipv4.ip_forward=0, quarantine stale files
-        "send_redirects": False,
-        "accept_redirects": False,
-        "accept_source_route": False,
-        "rp_filter_strict": True,
-        "martian_logging": True,
-        "syn_cookies": True,
         # 99-tailscale.conf was found setting ip_forward=1 with tailscale not
         # installed. Quarantining it is safe; the operator can undo.
         "quarantine_sysctl_files": True,
         "llmnr": False,  # systemd-resolved LLMNR=no
-        "mdns_stub_restrict": True,
     },
     "detect": {
         "interval_seconds": 3.0,
-        "process_interval_seconds": 15.0,
+        # Subprocess-backed rules (firewall-cmd) and journal reads are cached
+        # for this long. They answer "what is the machine configured like",
+        # which changes on a human timescale, not a 3-second one.
+        "external_interval_seconds": 300,
         "integrity_interval_seconds": 900.0,
         "process_cwd": "/var/lib/ward",
         # Per-process outbound fan-out, the strongest behavioural tell that a
         # process is relaying for strangers.
-        "fanout_conn_threshold": 60,  # concurrent conns to distinct remote IPs
-        "fanout_distinct_ip_threshold": 25,
-        "fanout_window_seconds": 120,
-        "fanout_min_bytes": 8 * 1024 * 1024,
         # Listener rules
-        "allow_loopback_listeners": True,
-        "known_proxy_ports": [
-            1080, 1081, 10808, 10809, 3128, 8000, 8008, 8080, 8118, 8888,
-            9050, 9051, 9150, 1080, 1086, 2080, 3128, 3333, 4444, 5555,
-            6666, 6667, 6697, 7777, 8880, 9090, 10000, 12345, 31337,
-        ],
         # Relay-bandwidth heuristics
-        "relay_mbps_threshold": 8.0,
-        "relay_egress_ratio": 0.90,
         "integrity_paths": [
             "/etc/passwd", "/etc/shadow", "/etc/group", "/etc/sudoers",
             "/etc/ssh/sshd_config", "/etc/hosts", "/etc/resolv.conf",
@@ -112,25 +94,21 @@ DEFAULTS: dict[str, Any] = {
         "mode": "observe",  # observe | contain | kill | lockdown
         # Score at or above which we act. 0-100.
         "contain_score": 70,
-        "kill_score": 88,
-        "lockdown_score": 95,
         "auto_kill": False,  # deliberate opt-in; see README before enabling
         "auto_lockdown": False,
         "forensics": True,
-        "quarantine_dir": "/var/lib/ward/quarantine",
+        "quarantine_dir": "/var/lib/ward/quarantine/bin",
         "snapshot_dir": "/var/lib/ward/snapshots",
         "kill_grace_seconds": 3.0,
         "cgroup_quarantine": True,
         "notify": True,
         "notify_threshold": 60,
-        "journal": True,
     },
     "baseline": {
         # First run records the current process/socket inventory as known-good.
         # Anything that appears later is a diff, not a guess.
         "learn_on_first_run": True,
         "file": "/var/lib/ward/baseline.json",
-        "max_age_days": 30,
     },
     "daemon": {
         # The tripwire's only input. If this file goes stale, containment is
@@ -146,10 +124,6 @@ DEFAULTS: dict[str, Any] = {
         "rotate_bytes": 32 * 1024 * 1024,
         "keep_days": 90,
         "max_events_per_minute": 240,
-    },
-    "harden_units": {
-        # Where systemd unit files are installed.
-        "system_dir": "/etc/systemd/system",
     },
 }
 

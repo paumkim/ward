@@ -47,6 +47,9 @@ for u in ward.service ward-harden.service ward-tripwire.service ward-tripwire.ti
 done
 systemctl daemon-reload
 
+log "sealing WARD's own files"
+"$BIN" seal >/dev/null 2>&1 && log "self-hashes recorded (self-tamper baseline)"
+
 log "validating the nftables ruleset"
 if "$BIN" firewall >/dev/null 2>&1; then
     log "ruleset validates"

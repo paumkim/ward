@@ -13,7 +13,7 @@ import re
 import shlex
 import subprocess
 import time
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 # ---------------------------------------------------------------- time
 
@@ -219,18 +219,6 @@ def is_wildcard(host: str) -> bool:
     return host in ("0.0.0.0", "::", "*", "")
 
 
-def is_linklocal(host: str) -> bool:
-    return host.startswith(("169.254.", "fe80:", "fe80::"))
-
-
-def is_multicast(host: str) -> bool:
-    return (
-        host.startswith("224.")
-        or host.startswith("ff")
-        or host in ("ff00::",)
-    )
-
-
 def net16(host: str) -> str:
     parts = host.split(".")
     return ".".join(parts[:2]) if len(parts) == 4 else host
@@ -247,16 +235,6 @@ def human_bytes(n: float) -> str:
     return f"{n:.1f}PB"
 
 
-def human_int(n: int) -> str:
-    return f"{n:,}"
-
-
 def truncate(s: str, n: int) -> str:
     s = s.replace("\x00", "")
     return s if len(s) <= n else s[: n - 1] + "\u2026"
-
-
-def first(iterable: Iterable[Any], default: Any = None) -> Any:
-    for item in iterable:
-        return item
-    return default

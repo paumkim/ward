@@ -193,15 +193,6 @@ def cmdline_false_positives(sigs: list[Sig] | None = None) -> list[tuple[str, st
     return list(hits.items())
 
 
-# ------------------------------------------------------------------ paths
-# Files that should not exist on a machine that is not a relay.
-PATH_SIGS: list[Sig] = [
-    Sig("resi-config", "path", r"/(etc|opt|var/lib)/[\w./-]*(resi|residential)[-_]?proxy", 80,
-        "residential proxy config path"),
-    Sig("proxy-cred", "path", r"/\.(config|ward)/[\w./-]*proxy.*\.(json|yaml|yml|conf|txt)$", 45,
-        "proxy credentials/config in dotfiles"),
-]
-
 # ------------------------------------------------------------------ binary content
 # Byte patterns that indicate a proxy/tunnel binary.
 #
@@ -348,7 +339,6 @@ VENDOR_TEXT_RX = re.compile(
 EXE_RX = [(s, _rx(s.pattern)) for s in EXE_SIGS]
 CMDLINE_RX = [(s, _rx(s.pattern)) for s in CMDLINE_SIGS]
 CMDLINE_WORD_RX = [(s, _rx(s.pattern)) for s in CMDLINE_WORD_SIGS]
-PATH_RX = [(s, _rx(s.pattern)) for s in PATH_SIGS]
 
 
 def match_exe(name: str) -> Sig | None:
@@ -398,13 +388,6 @@ def match_cmdline_word(cmd: str) -> Sig | None:
         if rx.search(haystack) and (best is None or sig.score > best.score):
             best = sig
     return best
-
-
-def match_path(path: str) -> Sig | None:
-    for sig, rx in PATH_RX:
-        if rx.search(path):
-            return sig
-    return None
 
 
 def match_vendor_text(text: str) -> bool:

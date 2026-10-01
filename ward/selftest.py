@@ -230,19 +230,6 @@ class HttpProxy(threading.Thread):
 # ------------------------------------------------------------------ python
 
 
-def _run(tmpdir: str, name: str, body: str, wait: float = 0.6) -> Any:
-    """Run a small python program detached; return the Popen handle."""
-    path = os.path.join(tmpdir, name)
-    with open(path, "w") as fh:
-        fh.write(textwrap.dedent(body))
-    proc = subprocess.Popen(
-        [sys.executable, path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    time.sleep(wait)
-    return proc
-
 
 def _relay_binary(tmpdir: str, name: str) -> str | None:
     """A real executable whose name is a known relay program.
@@ -300,26 +287,6 @@ while True:
 """
 
 
-def _port_of(pid: int) -> int | None:
-    for entry in os.scandir("/proc"):
-        if not entry.name.isdigit():
-            continue
-        raw = util.read_text(f"/proc/{entry.name}/stat", 4096)
-        idx = raw.rfind(")")
-        tail = raw[idx + 2 :].split() if idx > 0 else []
-        if len(tail) > 1 and tail[1].isdigit() and int(tail[1]) == pid:
-            for line in util.read_text(f"/proc/{entry.name}/net/tcp", 1 << 16).splitlines()[1:]:
-                parts = line.split()
-                if len(parts) > 3 and parts[3] == "0A":
-                    return int(parts[1].split(":")[1], 16)
-    return None
-
-
-def _exe_base(pid: int) -> str:
-    try:
-        return os.path.basename(os.readlink(f"/proc/{pid}/exe"))
-    except OSError:
-        return ""
 
 
 # ------------------------------------------------------------------ tests
@@ -489,10 +456,13 @@ def run(verbose: bool = True, quick: bool = False) -> int:
             That is how a detection rule dies without anyone noticing, so assert
             the fallback set is empty.
             """
-            for sig in signatures.EXE_SIGS + signatures.CMDLINE_SIGS + signatures.PATH_SIGS:
+            total = 0
+            for sig in (signatures.EXE_SIGS + signatures.CMDLINE_SIGS
+                        + signatures.CMDLINE_WORD_SIGS):
                 signatures._rx(sig.pattern)
+                total += 1
             assert not signatures.BROKEN_PATTERNS, sorted(signatures.BROKEN_PATTERNS)
-            return True, f"all {len(signatures.EXE_SIGS) + len(signatures.CMDLINE_SIGS) + len(signatures.PATH_SIGS)} patterns compile"
+            return True, f"all {total} patterns compile"
 
         suite.check("signatures: no pattern silently degraded to a literal",
                     t_no_broken_patterns)
@@ -795,6 +765,123 @@ def run(verbose: bool = True, quick: bool = False) -> int:
 
         suite.check("SAFETY: baseline keys survive IPv6 and a DHCP change",
                     t_baseline_key_survives_ipv6)
+
+        def t_cycle_time_budget():
+            """A scan must finish well inside its own interval.
+
+            Found in review: rule_port_exposure shelled out to firewall-cmd
+            every cycle, which took 8.02s against a 3s interval. The daemon
+            ran permanently behind and burned 15% CPU for nothing.
+            """
+            cfg = _cfg(detect__interval_seconds=3.0)
+            cache: dict[str, Any] = {}
+            detect.scan(cfg, host_bytes=None, do_integrity=False, cache=cache)
+            warm = []
+            for _ in range(3):
+                t0 = time.perf_counter()
+                detect.scan(cfg, host_bytes=None, do_integrity=False, cache=cache)
+                warm.append(time.perf_counter() - t0)
+            budget = float(cfg.get("detect.interval_seconds")) * 0.5
+            worst = max(warm)
+            assert worst < budget, (
+                f"warm cycle {worst:.2f}s exceeds {budget:.2f}s "
+                f"(half the {cfg.get('detect.interval_seconds')}s interval)"
+            )
+            return True, f"warm cycles {min(warm):.2f}-{worst:.2f}s, budget {budget:.2f}s"
+
+        suite.check("PERF: a warm scan fits inside half its interval",
+                    t_cycle_time_budget)
+
+        def t_external_cache_is_used():
+            """The cached rule must not re-shell-out, and must be stable."""
+            cfg = _cfg()
+            cache: dict[str, Any] = {}
+            calls = {"n": 0}
+            real = util.run
+
+            def counting_run(argv, **kw):
+                if argv and argv[0] == "firewall-cmd":
+                    calls["n"] += 1
+                return real(argv, **kw)
+
+            util.run = counting_run
+            try:
+                detect.rule_port_exposure(cfg, cache)
+                after_first = calls["n"]
+                detect.rule_port_exposure(cfg, cache)
+                after_second = calls["n"]
+            finally:
+                util.run = real
+            assert after_second == after_first, (
+                f"second call re-ran firewall-cmd ({after_first} -> {after_second})"
+            )
+            return True, f"1 subprocess for {2} calls"
+
+        suite.check("PERF: the firewall query is cached, not re-run per cycle",
+                    t_external_cache_is_used)
+
+        def t_exec_revoke_round_trip():
+            """chmod 000 must be reversible. It had no inverse at all."""
+            tmp2 = tempfile.mkdtemp(prefix="ward-revoke-")
+            exe = os.path.join(tmp2, "victim")
+            shutil.copyfile("/usr/bin/sleep", exe)
+            os.chmod(exe, 0o755)
+            try:
+                os.chmod(exe, 0o000)
+                assert not (os.stat(exe).st_mode & 0o111), "precondition"
+                ok, msg = respond.restore_binary_exec(exe)
+                assert ok, msg
+                assert os.stat(exe).st_mode & 0o111, "exec bit not restored"
+                # idempotent
+                ok2, msg2 = respond.restore_binary_exec(exe)
+                assert ok2, msg2
+            finally:
+                shutil.rmtree(tmp2, ignore_errors=True)
+            return True, "chmod 000 -> 755, idempotent"
+
+        suite.check("SAFETY: a revoked exec bit can be restored",
+                    t_exec_revoke_round_trip)
+
+        def t_no_dead_code():
+            """Nothing should be defined and never referenced.
+
+            Fourteen functions and twenty-one config keys were found dead by
+            this check. A knob that nothing reads is worse than no knob: an
+            operator reads relay_mbps_threshold and believes it does
+            something.
+            """
+            import ast
+            import glob as _glob
+            import re as _re
+            here = os.path.dirname(os.path.abspath(__file__))
+            texts = {}
+            for path in _glob.glob(os.path.join(here, "*.py")):
+                texts[path] = util.read_text(path, 1 << 22)
+            everything = "\n".join(texts.values())
+            dead: list[str] = []
+            for path, src in texts.items():
+                if path.endswith("selftest.py"):
+                    continue
+                for node in ast.walk(ast.parse(src)):
+                    if isinstance(node, ast.FunctionDef):
+                        ident = node.name
+                        if ident.startswith("__") or ident.startswith("_"):
+                            continue
+                        if len(_re.findall(rf"\b{_re.escape(ident)}\b", everything)) <= 1:
+                            dead.append(f"{os.path.basename(path)}:{node.lineno} {ident}")
+            assert not dead, f"unreferenced functions: {dead}"
+            # and no config key that nothing reads
+            cfg_src = texts[os.path.join(here, "config.py")]
+            defaults = set(_re.findall(r'^        "([a-z0-9_]+)":', cfg_src, _re.M))
+            unread = []
+            for key in sorted(defaults):
+                if not _re.search(rf'get\("[a-z.]*{key}"', everything):
+                    unread.append(key)
+            assert not unread, f"config keys nothing reads: {unread}"
+            return True, f"0 dead functions, 0 unread config keys of {len(defaults)}"
+
+        suite.check("HYGIENE: no dead functions, no unread config keys",
+                    t_no_dead_code)
 
         # ============ end safety properties ============
         def t_content_scan_real_binaries():

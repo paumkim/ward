@@ -43,10 +43,6 @@ class Socket:
         return self.state == "LISTEN" and self.proto.startswith("tcp")
 
     @property
-    def externally_bound(self) -> bool:
-        return not util.is_loopback(self.local) and not util.is_wildcard(self.local)
-
-    @property
     def wildcard_bound(self) -> bool:
         return util.is_wildcard(self.local)
 
@@ -247,10 +243,17 @@ def _boot_time() -> tuple[float, float]:
 
 
 def observe_processes(
-    include_content_scan: bool = True, content_limit: int = 6 << 20
+    include_content_scan: bool = True,
+    content_limit: int = 6 << 20,
+    sockets: tuple[list[Socket], list[Socket]] | None = None,
 ) -> list[Proc]:
+    """Collect every process, with its sockets attached.
+
+    `sockets` lets a caller that already called observe_sockets() pass the
+    result in. Without it, a scan walked every /proc/*/fd twice.
+    """
     btime, hz = _boot_time()
-    listeners, conns = observe_sockets()
+    listeners, conns = sockets if sockets is not None else observe_sockets()
     list_by_pid: dict[int, list[Socket]] = {}
     conn_by_pid: dict[int, list[Socket]] = {}
     for sock in listeners:
@@ -427,10 +430,6 @@ def _uid_map() -> dict[int, str]:
         except OSError:
             pass
     return _UID_CACHE
-
-
-def uid_name(uid: int) -> str:
-    return _uid_map().get(uid, str(uid))
 
 
 # ------------------------------------------------------------------ host state
@@ -650,36 +649,6 @@ def listdir_snapshot(paths: Iterable[str]) -> dict[str, list[str]]:
                 break
         out[path] = sorted(rows)
     return out
-
-
-def setuid_inventory() -> dict[str, list[str]]:
-    found: dict[str, list[str]] = {"suid": [], "sgid": [], "world_writable": []}
-    for base in ("/usr/bin", "/usr/sbin", "/bin", "/sbin", "/usr/local/bin",
-                 "/usr/local/sbin", "/opt", "/home"):
-        if not os.path.isdir(base):
-            continue
-        for root, dirs, files in os.walk(base, topdown=True, followlinks=False):
-            dirs[:] = [
-                d
-                for d in dirs
-                if d not in (".git", "node_modules", "__pycache__", "snap", "flatpak")
-            ]
-            for name in files:
-                full = os.path.join(root, name)
-                try:
-                    st = os.lstat(full)
-                except OSError:
-                    continue
-                mode = st.st_mode
-                if mode & 0o4000:
-                    found["suid"].append(full)
-                if mode & 0o2000:
-                    found["sgid"].append(full)
-                if base != "/home" and mode & 0o002 and st.st_uid == 0:
-                    found["world_writable"].append(full)
-            if len(found["suid"]) > 500:
-                break
-    return found
 
 
 # ------------------------------------------------------------------ baseline
