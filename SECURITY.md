@@ -28,7 +28,7 @@ carries strangers' traffic out over your residential IP.
 
 ### Out of scope
 
-- **A remote host using this machine as a plain internet gateway.** Nothing is
+- A remote host using this machine as a plain internet gateway. Nothing is
   listening locally, so there is nothing to observe. WARD closes the kernel-level
   routes (`ip_forward=0`, `forward` policy drop, no masquerade). Software-level
   abuse of a machine behaving like an ordinary endpoint is out of reach, and this
