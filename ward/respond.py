@@ -293,7 +293,8 @@ def _find_original(name: str) -> str | None:
     return None
 
 
-def move_binary_to_quarantine(config, pid: int) -> tuple[bool, str]:
+def move_binary_to_quarantine(config, pid: int,
+                              journal: harden.Journal | None = None) -> tuple[bool, str]:
     """Revoke the binary while the process is still running.
 
     chmod 000 on the file removes the ability to exec a second copy; the
@@ -310,10 +311,25 @@ def move_binary_to_quarantine(config, pid: int) -> tuple[bool, str]:
     copy = os.path.join(qdir, f"{time.strftime('%Y%m%dT%H%M%S')}-{os.path.basename(exe)}")
     try:
         shutil.copyfile(exe, copy, follow_symlinks=True)
+        mode = os.stat(exe).st_mode & 0o7777
+        if journal is not None:
+            # Record the original mode. `ward release` covers the common case;
+            # this is what makes `ward restore` complete.
+            journal.record(
+                "binary-exec-revoked", exe, {"mode": oct(mode)},
+                {"mode": "0o0", "copy": copy},
+                note=f"pid {pid} {proc_cmd(pid)}",
+            )
         os.chmod(exe, 0o000)
     except OSError as exc:
         return False, str(exc)
     return True, f"copied to {copy}, chmod 000 on {exe}"
+
+
+def proc_cmd(pid: int) -> str:
+    return util.truncate(
+        util.read_text(f"/proc/{pid}/cmdline", 4096).replace("\x00", " ").strip(), 120
+    ) or "(no cmdline)"
 
 
 # ------------------------------------------------------------------ terminate
@@ -529,7 +545,10 @@ def respond(config, verdict: Verdict, log=None, dry_run: bool = False) -> Respon
         if cfg.get("cgroup_quarantine", True) and mode in ("contain", "lockdown"):
             ok, msg = quarantine_cgroup(pid)
             res.actions.append(Action(f"freeze:{pid}", ok, msg))
-        ok, msg = move_binary_to_quarantine(config, pid)
+        ok, msg = move_binary_to_quarantine(
+            config, pid,
+            journal=harden.Journal(path="/var/lib/ward/restore-journal.jsonl"),
+        )
         res.actions.append(Action(f"revoke-exec:{pid}", ok, msg))
 
     if mode in ("kill", "lockdown"):

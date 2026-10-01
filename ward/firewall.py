@@ -234,8 +234,13 @@ def check(config) -> tuple[bool, str]:
             pass
 
 
-def apply(config, persist: bool = True) -> tuple[bool, str]:
-    """Install the WARD table. Only touches our own table."""
+def apply(config, persist: bool = True,
+          journal: Any = None) -> tuple[bool, str]:
+    """Install the WARD table. Only touches our own table.
+
+    Journalled when a journal is supplied, so `ward restore` can take the table
+    and the persisted copy back off the machine.
+    """
     if not util.is_root():
         return False, "nftables apply requires root"
     ok, msg = check(config)
@@ -244,16 +249,31 @@ def apply(config, persist: bool = True) -> tuple[bool, str]:
     rc, out, err = run(["nft", "list", "ruleset"], timeout=10)
     family = config.get("firewall.family", "inet")
     table = config.get("firewall.table", TABLE)
-    pre = f"delete table {family} {table}\n" if f"table {family} {table}" in out else ""
+    # Match the table name exactly. A substring test says the table exists when
+    # only "inet ward_quarantine" does, and the delete then fails with
+    # "No such file or directory", which takes the whole systemd unit down.
+    pre = (
+        f"delete table {family} {table}\n"
+        if re.search(rf"^\s*table\s+{re.escape(family)}\s+{re.escape(table)}\s*{{",
+                     out, re.M)
+        else ""
+    )
     rc, out, err = _nft(pre + render(config))
     if rc != 0:
         return False, f"nft -f failed: {err.strip() or out.strip()}"
+    persisted = "/etc/ward/nftables-ward.conf" if persist else None
     if persist:
-        path = "/etc/ward/nftables-ward.conf"
         try:
-            util.atomic_write(path, render(config), 0o600)
+            util.atomic_write(persisted, render(config), 0o600)
         except OSError as exc:
             return True, f"applied (persist failed: {exc})"
+    if journal is not None:
+        journal.record(
+            "nft-table-applied", f"{family} {table}",
+            {"existed": bool(pre), "persisted": persisted},
+            {"applied": True},
+            note="ward firewall --apply",
+        )
     return True, f"applied table {family} {table}"
 
 

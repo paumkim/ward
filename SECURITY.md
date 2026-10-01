@@ -48,6 +48,10 @@ nftables requires it. It therefore trusts:
 - Its own configuration files. `ward selftest` and `ward events --verify` are
   the checks for "has someone edited me".
 
+`ward restore` reverses every journalled change, and a self-test fails if
+`harden()` records a change that `restore()` cannot undo. `ward restore` also
+prints any sysctl value that did not come back, rather than claiming success.
+
 `auto_kill` and `auto_lockdown` ship **disabled**. WARD will freeze and
 quarantine a process before it kills one, and it will never target anything in
 `signatures.PROTECTED_EXES`. Turn those on only after reading

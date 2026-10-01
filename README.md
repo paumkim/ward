@@ -20,7 +20,7 @@ sudo ./install.sh
 
 sudo ward harden             # sysctl, LLMNR, sshd pinning, firewalld ports
 sudo ward firewall --apply   # default-deny inbound, no transit forwarding
-sudo ward selftest           # 70 checks: detection, safety, performance, hygiene
+sudo ward selftest           # 73 checks: detection, safety, performance, hygiene
 ward status                  # current verdict
 ```
 
@@ -82,7 +82,20 @@ first, so a firewalld misconfiguration cannot open a hole.
   `AllowAgentForwarding`
 - firewalld's open public ports and unused services closed
 
-Every change is journalled to `/var/lib/ward/restore-journal.jsonl`.
+Every change is journalled to `/var/lib/ward/restore-journal.jsonl`, including
+the live sysctl values captured before they were changed.
+
+`sudo ward restore` reverses all of it: removes the two config files, reloads
+sysctl from whatever files remain, restarts resolved, reopens the firewalld
+ports and services, removes the nft table, and restores any exec bit it revoked.
+It prints the count and names anything it could not reverse. A self-test walks
+the source and fails if `harden()` records a change that `restore()` has no
+handler for, so the two cannot drift apart again.
+
+The round trip was verified on this host: with WARD fully removed the public
+zone held `dhcpv6-client ssh` and `8765/tcp`; after `ward harden` it held
+`dhcpv6-client` and nothing; after `ward restore` it was back to `dhcpv6-client
+ssh` and `8765/tcp`.
 
 ## Detection
 
@@ -223,7 +236,7 @@ Everything runs on `127.0.0.1`, so the test never puts a working proxy on a real
 interface.
 
 ```
-70/70 passed
+73/73 passed
 ```
 
 Roughly a quarter of the codebase is tests. Two of the checks are worth knowing

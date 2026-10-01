@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from typing import Any
@@ -185,7 +186,42 @@ def find_conflicting_sysctl_files(needles: tuple[str, ...]) -> list[dict[str, An
     return list(hits.values())
 
 
-def install_sysctl_conf(dry_run: bool = False) -> tuple[bool, str]:
+#: Every knob the hardening file sets. Restoring means putting these back to
+#: whatever the machine had before WARD touched them, so the live values are
+#: captured first. sysctl --system does the rest.
+HARDPENNED_SYSCTLS = [
+    "net.ipv4.ip_forward",
+    "net.ipv6.conf.all.forwarding",
+    "net.ipv4.conf.all.send_redirects",
+    "net.ipv4.conf.default.send_redirects",
+    "net.ipv4.conf.all.accept_redirects",
+    "net.ipv4.conf.default.accept_redirects",
+    "net.ipv4.conf.all.accept_source_route",
+    "net.ipv4.conf.default.accept_source_route",
+    "net.ipv4.conf.all.secure_redirects",
+    "net.ipv4.conf.all.accept_local",
+    "net.ipv4.conf.default.accept_local",
+    "net.ipv4.conf.all.rp_filter",
+    "net.ipv4.conf.default.rp_filter",
+    "net.ipv4.conf.all.log_martians",
+    "net.ipv4.icmp_echo_ignore_broadcasts",
+    "net.ipv4.icmp_ignore_bogus_error_responses",
+    "net.ipv4.tcp_syncookies",
+    "net.ipv4.tcp_rfc1337",
+]
+
+
+def snapshot_sysctls() -> dict[str, str | None]:
+    """Current values of every knob the hardening file writes."""
+    out: dict[str, str | None] = {}
+    for key in HARDPENNED_SYSCTLS:
+        rc, value, _ = run(["sysctl", "-n", key], timeout=4)
+        out[key] = value.strip() if rc == 0 else None
+    return out
+
+
+def install_sysctl_conf(dry_run: bool = False,
+                        journal: Journal | None = None) -> tuple[bool, str]:
     body, skipped = render_hardening_conf()
     if os.path.isfile(WARD_SYSCTL):
         existing = util.read_text(WARD_SYSCTL)
@@ -194,6 +230,22 @@ def install_sysctl_conf(dry_run: bool = False) -> tuple[bool, str]:
             return True, f"{WARD_SYSCTL} already current{note}"
     if dry_run:
         return True, f"would write {WARD_SYSCTL}"
+    # Record what was there and what the live values were. Without the live
+    # snapshot, restore can delete the file but has no way to put the runtime
+    # values back, because sysctl -p loads one file rather than all of them.
+    if journal is not None:
+        journal.record(
+            "sysctl-conf-written", WARD_SYSCTL,
+            {"existed": os.path.isfile(WARD_SYSCTL),
+             "previous": util.read_text(WARD_SYSCTL, 1 << 16)},
+            {"exists": True, "keys": len(HARDPENNED_SYSCTLS)},
+            note="WARD hardening file; sorts last so it wins",
+        )
+        journal.record(
+            "sysctl-values-snapshot", "/proc/sys",
+            snapshot_sysctls(), {"owned_by": "99-ward-hardening.conf"},
+            note="live values before hardening, for restore to verify against",
+        )
     try:
         util.atomic_write(WARD_SYSCTL, body, 0o644)
     except OSError as exc:
@@ -250,7 +302,8 @@ def quarantine_conflicting_sysctl(hit: dict[str, Any], journal: Journal,
 # ------------------------------------------------------------------ resolved
 
 
-def disable_llmnr(dry_run: bool = False) -> tuple[bool, str]:
+def disable_llmnr(dry_run: bool = False,
+                  journal: Journal | None = None) -> tuple[bool, str]:
     """Turn off LLMNR in systemd-resolved.
 
     LLMNR answers name queries for anything, including neighbours' traffic, and
@@ -267,6 +320,14 @@ def disable_llmnr(dry_run: bool = False) -> tuple[bool, str]:
     )
     if dry_run:
         return True, f"would write {dropin}"
+    if journal is not None:
+        journal.record(
+            "resolved-dropin-written", dropin,
+            {"existed": os.path.isfile(dropin),
+             "previous": util.read_text(dropin, 1 << 16)},
+            {"exists": True, "llmnr": "no"},
+            note="LLMNR off; restore removes this and restarts resolved",
+        )
     util.ensure_dir(dropin_dir, 0o755)
     try:
         util.atomic_write(dropin, body, 0o644)
@@ -439,7 +500,7 @@ def harden(config, dry_run: bool = False,
     res = HardeningResult(journal=journal or Journal())
     h = config.section("harden")
 
-    ok, msg = install_sysctl_conf(dry_run=dry_run)
+    ok, msg = install_sysctl_conf(dry_run=dry_run, journal=res.journal)
     (res.actions if ok else res.failures).append(msg)
 
     if h.get("ip_forward", False) is False:
@@ -469,7 +530,7 @@ def harden(config, dry_run: bool = False,
                 )
 
     if h.get("llmnr", False) is False:
-        ok, msg = disable_llmnr(dry_run=dry_run)
+        ok, msg = disable_llmnr(dry_run=dry_run, journal=res.journal)
         (res.actions if ok else res.failures).append(msg)
 
     ok, msg = harden_sshd(res.journal, dry_run=dry_run)
@@ -489,43 +550,179 @@ def harden(config, dry_run: bool = False,
 
 def restore(journal_path: str = "/var/lib/ward/restore-journal.jsonl",
             dry_run: bool = False) -> list[dict[str, Any]]:
-    """Undo journalled changes, newest first."""
+    """Undo journalled changes, newest first.
+
+    Every mutation `harden()` performs has a handler here. That was not true:
+    the sysctl file, the live sysctl values, the LLMNR drop-in and the firewalld
+    services were all either unjournalled or journalled with no handler, so
+    `ward restore` left most of the hardening in place while the README claimed
+    otherwise.
+    """
     j = Journal(path=journal_path)
     entries = j.load_all()
     undone: list[dict[str, Any]] = []
+    handled = 0
+    unhandled: list[str] = []
+
+    def finish(entry: dict[str, Any], result: str, ok: bool = True) -> None:
+        nonlocal handled
+        undone.append({**entry, "result": result})
+        if ok and not dry_run:
+            handled += 1
+
     for entry in reversed(entries):
         kind, target = entry.get("kind"), entry.get("target")
-        if dry_run:
-            undone.append({**entry, "result": "would undo"})
-            continue
+        before = entry.get("before") or {}
         try:
+            if dry_run:
+                finish(entry, "would undo", ok=False)
+                continue
+
             if kind == "sysctl-file-quarantined":
-                moved = (entry.get("before") or {}).get("moved_to")
+                moved = before.get("moved_to")
                 if moved and os.path.exists(moved) and not os.path.exists(target):
                     shutil.move(moved, target)
-                    undone.append({**entry, "result": "restored"})
+                    finish(entry, "restored the quarantined file")
                 else:
-                    undone.append({**entry, "result": "nothing to do"})
+                    finish(entry, "nothing to do", ok=False)
+
+            elif kind == "sysctl-conf-written":
+                _remove_our_file(target, before, finish, entry,
+                                 "/etc/sysctl.d/99-ward-hardening.conf")
+
+            elif kind == "sysctl-values-snapshot":
+                # The file is gone, so reload every remaining sysctl file in
+                # order. `sysctl -p /etc/sysctl.conf` loads exactly one file
+                # and would have left ip_forward at 0.
+                rc, out, err = run(["systemctl", "restart", "systemd-sysctl"],
+                                   timeout=25)
+                if rc == 0:
+                    finish(entry, "reloaded sysctl from the remaining files")
+                else:
+                    rc2, _, err2 = run(["sysctl", "--system"], timeout=25)
+                    finish(entry,
+                           "reloaded sysctl via sysctl --system" if rc2 == 0
+                           else f"sysctl reload failed: {(err or err2).strip()}",
+                           ok=rc2 == 0)
+                drift = sysctl_drift(before)
+                if drift:
+                    undone[-1]["drift"] = drift
+                    undone[-1]["result"] += (
+                        f"; {len(drift)} value(s) differ from the snapshot: "
+                        + ", ".join(f"{k}={v}" for k, v in list(drift.items())[:6])
+                    )
+
+            elif kind == "resolved-dropin-written":
+                _remove_our_file(target, before, finish, entry,
+                                 "/etc/systemd/resolved.conf.d/99-ward-hardening.conf")
+                rc, _, err = run(["systemctl", "restart", "systemd-resolved"],
+                                 timeout=25)
+                undone[-1]["result"] += (
+                    "; restarted resolved" if rc == 0
+                    else f"; resolved restart failed: {err.strip()}"
+                )
+
             elif kind == "firewalld-port-closed":
                 port = target.split(":", 1)[-1]
-                run(["firewall-cmd", "--permanent", "--zone=public", f"--add-port={port}"],
-                    timeout=10)
-                run(["firewall-cmd", "--zone=public", f"--add-port={port}"], timeout=10)
-                undone.append({**entry, "result": "reopened"})
+                run(["firewall-cmd", "--permanent", "--zone=public",
+                     f"--add-port={port}"], timeout=15)
+                run(["firewall-cmd", "--zone=public", f"--add-port={port}"],
+                    timeout=15)
+                finish(entry, f"reopened {port}")
+
+            elif kind == "firewalld-service-closed":
+                svc = target.split(":", 1)[-1]
+                run(["firewall-cmd", "--permanent", "--zone=public",
+                     f"--add-service={svc}"], timeout=15)
+                run(["firewall-cmd", "--zone=public", f"--add-service={svc}"],
+                    timeout=15)
+                finish(entry, f"reopened the {svc} service")
+
             elif kind == "sshd-pinned":
-                run(["rm", "-f", "/etc/ssh/sshd_config.d/99-ward-hardening.conf"], timeout=10)
-                undone.append({**entry, "result": "dropin removed"})
+                run(["rm", "-f", "/etc/ssh/sshd_config.d/99-ward-hardening.conf"],
+                    timeout=10)
+                finish(entry, "removed the sshd drop-in")
+
             elif kind == "sshd-include-added":
                 text = util.read_text(target, 1 << 20)
                 first, _, rest = text.partition("\n")
                 if first.startswith("Include /etc/ssh/sshd_config.d"):
                     util.atomic_write(target, rest, 0o644)
-                undone.append({**entry, "result": "include removed"})
+                finish(entry, "removed the Include line")
+
+            elif kind == "nft-table-applied":
+                from . import firewall as fw
+
+                ok, msg = fw.remove()
+                finish(entry, msg if ok else f"nft: {msg}", ok=ok)
+                persisted = before.get("persisted")
+                if persisted and os.path.isfile(persisted):
+                    try:
+                        os.remove(persisted)
+                        undone[-1]["result"] += f"; removed {persisted}"
+                    except OSError as exc:
+                        undone[-1]["result"] += f"; could not remove {persisted}: {exc}"
+
+            elif kind == "binary-exec-revoked":
+                path = target
+                mode = before.get("mode")
+                try:
+                    if mode is None:
+                        finish(entry, "no recorded mode; left as is", ok=False)
+                    else:
+                        os.chmod(path, int(mode, 8))
+                        finish(entry, f"restored {path} to {mode}")
+                except OSError as exc:
+                    finish(entry, f"failed: {exc}", ok=False)
+
             else:
+                unhandled.append(kind)
                 undone.append({**entry, "result": "no undo handler"})
         except OSError as exc:
             undone.append({**entry, "result": f"failed: {exc}"})
-    if not dry_run and entries:
-        run(["firewall-cmd", "--reload"], timeout=20)
-        run(["sysctl", "-p", "/etc/sysctl.conf"], timeout=20)
+
+    if not dry_run and handled:
+        run(["firewall-cmd", "--reload"], timeout=25)
+
+    undone.append({
+        "kind": "summary",
+        "result": f"{handled} change(s) undone",
+        "undone": handled,
+        "unhandled_kinds": sorted(set(unhandled)),
+    })
     return undone
+
+
+def _remove_our_file(target: str, before: dict, finish, entry: dict,
+                     ours: str) -> None:
+    """Remove a file WARD wrote, restoring a previous version if there was one."""
+    if target != ours:
+        finish(entry, f"refusing to remove {target}: not a WARD file", ok=False)
+        return
+    previous = before.get("previous")
+    try:
+        if previous:
+            util.atomic_write(target, previous, 0o644)
+            finish(entry, f"restored the previous {target}")
+        elif os.path.isfile(target):
+            os.remove(target)
+            finish(entry, f"removed {target}")
+        else:
+            finish(entry, "nothing to do", ok=False)
+    except OSError as exc:
+        finish(entry, f"failed: {exc}", ok=False)
+
+
+def sysctl_drift(before: dict[str, Any]) -> dict[str, str]:
+    """Knobs whose current value differs from the pre-hardening snapshot."""
+    out: dict[str, str] = {}
+    for key, was in (before or {}).items():
+        if was is None:
+            continue
+        rc, now_value, _ = run(["sysctl", "-n", key], timeout=4)
+        if rc != 0:
+            continue
+        have = now_value.strip()
+        if have != str(was):
+            out[key] = f"{was} -> {have}"
+    return out

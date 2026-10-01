@@ -344,7 +344,23 @@ def cmd_restore(args) -> int:
         print("  nothing journalled to restore")
         return 0
     for entry in out:
-        print(f"  {c(entry.get('result', '?'), CYAN)}  {entry.get('target')}")
+        if entry.get("kind") == "summary":
+            continue
+        colour = RED if entry["result"].startswith(("failed", "no undo handler")) else CYAN
+        print(f"  {c(entry.get('result', '?'), colour)}  {c(entry.get('target') or '', DIM)}")
+    summary = next((e for e in out if e.get("kind") == "summary"), None)
+    if summary:
+        print()
+        unhandled = summary.get("unhandled_kinds") or []
+        if unhandled:
+            print(f"  {c('NOT restored', RED)}: {', '.join(unhandled)}")
+            print("  those change kinds have no undo handler; see docs")
+        else:
+            print(f"  {c(summary['result'], GREEN)}")
+        drift = [e for e in out if e.get("drift")]
+        for entry in drift:
+            for key, text in entry["drift"].items():
+                print(f"  {c('drift', YELLOW)}  {key}: {text}")
     return 0
 
 
@@ -361,7 +377,10 @@ def cmd_firewall(args) -> int:
         print(script)
         return 0 if ok else 1
     util.require_root("firewall")
-    ok, msg = firewall.apply(config, persist=not args.no_persist)
+    ok, msg = firewall.apply(
+        config, persist=not args.no_persist,
+        journal=harden.Journal(path="/var/lib/ward/restore-journal.jsonl"),
+    )
     print(f"  {c('ok', GREEN) if ok else c('FAILED', RED)}  {msg}")
     if ok and not args.no_counters:
         counts = firewall.counters(config)

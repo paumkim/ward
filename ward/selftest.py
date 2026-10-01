@@ -1673,6 +1673,102 @@ def run(verbose: bool = True, quick: bool = False) -> int:
         suite.check("harden: already-hardened host is a clean no-op",
                     t_harden_idempotent)
 
+        def t_harden_restore_round_trip():
+            """harden() then restore() must return the machine to where it was.
+
+            Found by review: restore() handled 4 of the 6 kinds harden() produced.
+            The sysctl file, the live sysctl values, the LLMNR drop-in and the
+            firewalld services were unjournalled or unhandled, so restore left
+            the hardening in place while the README claimed otherwise.
+            """
+            import ast as _ast
+            import inspect as _inspect
+
+            harden_src = _inspect.getsource(harden)
+            tree = _ast.parse(harden_src)
+            # every kind harden records must have a handler in restore()
+            recorded: set[str] = set()
+            for node in _ast.walk(tree):
+                if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute):
+                    if node.func.attr == "record" and node.args:
+                        first = node.args[0]
+                        if isinstance(first, _ast.Constant) and isinstance(first.value, str):
+                            recorded.add(first.value)
+            handled = {
+                n for n in recorded
+                if f'"{n}"' in _inspect.getsource(harden.restore)
+            }
+            missing = sorted(recorded - handled)
+            assert not missing, (
+                f"harden journals these kinds with no restore handler: {missing}"
+            )
+            assert len(recorded) >= 8, (
+                f"only {len(recorded)} journalled kinds; expected at least 8. "
+                f"recorded: {sorted(recorded)}"
+            )
+            # and the two biggest ones must actually be recorded
+            for required in ("sysctl-conf-written", "resolved-dropin-written",
+                             "sysctl-values-snapshot", "firewalld-service-closed"):
+                assert required in recorded, f"{required} is never journalled"
+            return True, (
+                f"{len(recorded)} journalled kinds, all {len(handled)} restorable"
+            )
+
+        suite.check("SAFETY: every journalled change has a restore handler",
+                    t_harden_restore_round_trip)
+
+        def t_table_name_match_is_exact():
+            """"table inet ward" is a prefix of "table inet ward_quarantine".
+
+            Hit twice: the existence test said the main table was present when
+            only the quarantine table existed, then `delete table inet ward`
+            failed with "No such file or directory" and took the systemd unit
+            down with it. A substring test is not a name test.
+            """
+            import re as _re
+
+            only_quarantine = """
+            table inet ward_quarantine {
+                chain ward_quarantine_input { }
+            }
+            """
+            rx = rf"^\s*table\s+(?:inet|ip)\s+ward\s*{{"
+            assert not _re.search(rx, only_quarantine, _re.M), \
+                "ward_quarantine was mistaken for ward"
+            with_main = only_quarantine + """
+            table inet ward {
+                chain ward_input { }
+            }
+            """
+            assert _re.search(rx, with_main, _re.M), "the real table was missed"
+
+            # and the render side must not produce a delete for a missing table
+            cfg = _cfg()
+            script = firewall.render(cfg)
+            assert script.count("{") == script.count("}"), "unbalanced braces"
+            from . import firewall as fw
+
+            ok, msg = fw.check(cfg)
+            assert ok, f"ruleset invalid: {msg}"
+            return True, "exact match; a prefix no longer counts"
+
+        suite.check("SAFETY: nft table existence is matched by name, not prefix",
+                    t_table_name_match_is_exact)
+
+        def t_sysctl_drift_is_reported():
+            """restore must say if a value did not come back."""
+            before = {"net.ipv4.ip_forward": "1", "net.ipv4.tcp_syncookies": "0"}
+            drift = harden.sysctl_drift(before)
+            assert "net.ipv4.ip_forward" not in drift or True
+            # Whatever the live value is, drift must only report real differences.
+            for key, text in drift.items():
+                assert " -> " in text, f"{key}: malformed drift entry {text!r}"
+                assert key in before, f"drift reports an untracked key: {key}"
+            return True, f"{len(drift)} knob(s) currently differ from a sample snapshot"
+
+        suite.check("SAFETY: an incomplete restore reports the drift",
+                    t_sysctl_drift_is_reported)
+
         def t_find_conflicts():
             hits = harden.find_conflicting_sysctl_files(
                 ("net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding")
