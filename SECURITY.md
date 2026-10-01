@@ -28,11 +28,11 @@ carries strangers' traffic out over your residential IP.
 
 ### Out of scope
 
-- **A remote host using this machine as a plain internet gateway.** If nothing
-  is listening locally, there is nothing to observe. WARD closes the kernel-level
-  routes (`ip_forward=0`, `forward` policy drop, no masquerade) but cannot
-  detect software-level abuse of a machine that is behaving like an ordinary
-  endpoint. This is a real limitation, not an oversight.
+- **A remote host using this machine as a plain internet gateway.** Nothing is
+  listening locally, so there is nothing to observe. WARD closes the kernel-level
+  routes (`ip_forward=0`, `forward` policy drop, no masquerade). Software-level
+  abuse of a machine behaving like an ordinary endpoint is out of reach, and this
+  document will not pretend otherwise.
 - Detecting general malware, ransomware, or a compromised browser
 - Web filtering, application allowlisting or antivirus
 - Tracking you, or anything requiring a cloud account or a phone-home
