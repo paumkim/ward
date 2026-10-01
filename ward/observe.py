@@ -685,6 +685,13 @@ def setuid_inventory() -> dict[str, list[str]]:
 # ------------------------------------------------------------------ baseline
 
 
+#: Bump when the shape of baseline_state changes. A stored baseline from an
+#: older schema is not comparable to a fresh one, and diffing them produces a
+#: finding per listener rather than a re-learn. Found the hard way: changing
+#: the listener key format made every listener on the box look new.
+BASELINE_SCHEMA = 2
+
+
 def baseline_state(baseline: dict[str, Any], procs: list[Proc], listeners: list[Socket]) -> dict[str, Any]:
     """Reduce current state to a comparable, JSON-safe fingerprint set.
 
@@ -701,12 +708,17 @@ def baseline_state(baseline: dict[str, Any], procs: list[Proc], listeners: list[
             continue  # bookkeeping we do not care about
         modules.append(parts[0])
     return {
+        "schema": BASELINE_SCHEMA,
         "ts": now(),
         "processes": sorted(
             f"{p.exe_base}:{p.exe}" for p in procs if not p.protected
         ),
+        # Keyed on port and executable, not on the bound address. A DHCP lease
+        # renewal that changes 192.168.1.x to 192.168.1.y used to make every
+        # listener on the box look new, which produced a finding per listener
+        # and pushed the composite over the action threshold for good.
         "listeners": sorted(
-            f"{s.proto}:{s.local}:{s.local_port}:{s.exe.rsplit('/', 1)[-1]}"
+            f"{s.proto}|{s.local_port}|{s.exe.rsplit('/', 1)[-1]}"
             for s in listeners
         ),
         "modules": sorted(set(modules)),

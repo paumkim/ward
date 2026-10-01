@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import shutil
 import socket
 import struct
@@ -27,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import detect, firewall, harden, observe, signatures, sniff, util
+from . import detect, firewall, harden, observe, respond, signatures, sniff, util
 from .config import DEFAULTS, Config
 from .util import now
 
@@ -470,7 +471,9 @@ def run(verbose: bool = True, quick: bool = False) -> int:
             assert signatures.match_cmdline(
                 "socat TCP-LISTEN:1080,fork,reuseaddr TCP:evil.example:1080"
             ) is not None
-            assert signatures.match_cmdline("sell my bandwidth to strangers") is not None
+            assert signatures.match_cmdline("vendor --sell-bandwidth -t 0.0.0.0") is not None
+            # and the tightened pattern must NOT fire on ordinary prose
+            assert signatures.match_cmdline("sell my bandwidth to strangers") is None
             assert signatures.match_vendor_text("PROXY=iproyal:7000")
             assert signatures.match_vendor_text("gw.brightdata.com")
             assert not signatures.match_vendor_text("proxy.golang.org")
@@ -512,6 +515,288 @@ def run(verbose: bool = True, quick: bool = False) -> int:
 
         suite.check("signatures: content scan needs corroboration", t_content_scan)
 
+        # ============ SAFETY PROPERTIES ============
+        # These assert that WARD cannot harm the machine. They exist because an
+        # adversarial review found five ways it could, all of which were
+        # invisible to the detection tests above.
+
+        def t_mode_gate_is_fail_closed():
+            """Any mode string that is not exactly a valid mode must be inert.
+
+            Found in review: `respond()` compared mode to the literal
+            "observe", so "Observe", "observ" and "Contian" all fell through
+            to chmod 000 on the target binary.
+            """
+            from .config import normalise_mode
+            for raw in ("observe", "Observe", "OBSERVE", " observ ", "observ",
+                        "Contian", "", None, 0, "observe\n", "observe-please",
+                        "yes", "contain-x", "LOCKDOWN!", "kill 1"):
+                got = normalise_mode(raw)
+                assert got == "observe", f"{raw!r} normalised to {got!r}"
+            for raw in ("contain", "Contain", "kill", "KILL", "lockdown",
+                        " kill ", "kill\n", "contain\n", "  LockDown  "):
+                got = normalise_mode(raw)
+                assert got in ("contain", "kill", "lockdown"), \
+                    f"{raw!r} normalised to {got!r}"
+            return True, "15 malformed values all became observe"
+
+        suite.check("SAFETY: response mode fails closed on any typo",
+                    t_mode_gate_is_fail_closed)
+
+        def t_dry_run_never_chmods():
+            """A dry run must not change a single permission bit."""
+            tmp2 = tempfile.mkdtemp(prefix="ward-dryrun-")
+            exe = os.path.join(tmp2, "weatherd")
+            with open(exe, "wb") as fh:
+                fh.write(b"\x7fELF" + b"\x00" * 64)
+            os.chmod(exe, 0o755)
+            child = subprocess.Popen(["/usr/bin/sleep", "20"])
+            try:
+                time.sleep(0.3)
+                cfg = _cfg(respond__mode="contain", respond__forensics=False,
+                           respond__quarantine_dir=tmp2,
+                           respond__snapshot_dir=os.path.join(tmp2, "s"))
+                v = detect.Verdict(score=95, severity="critical",
+                                    findings=[detect.Finding(
+                                        "R01-relay-binary", "t", 95, "critical",
+                                        subjects=[{"pid": child.pid}])],
+                                    reasons=[])
+                respond.respond(cfg, v, log=None, dry_run=True)
+                m = os.stat(exe).st_mode & 0o777
+                assert m == 0o755, f"dry run changed the exe to {oct(m)}"
+            finally:
+                child.kill()
+                shutil.rmtree(tmp2, ignore_errors=True)
+            return True, "dry run left permissions untouched"
+
+        suite.check("SAFETY: dry_run never modifies the filesystem",
+                    t_dry_run_never_chmods)
+
+        def t_contain_never_chmods_in_observe():
+            """End-to-end: the whole respond() path is inert in observe."""
+            tmp2 = tempfile.mkdtemp(prefix="ward-observe-")
+            victim = os.path.join(tmp2, "innocent")
+            shutil.copyfile("/usr/bin/sleep", victim)
+            os.chmod(victim, 0o755)
+            child = subprocess.Popen([victim, "20"])
+            try:
+                time.sleep(0.3)
+                for mode in ("observe", "Observe", "OBSERVE", "observ", "Contian"):
+                    os.chmod(victim, 0o755)
+                    cfg = _cfg(respond__mode=mode, respond__forensics=False,
+                               respond__quarantine_dir=tmp2,
+                               respond__snapshot_dir=os.path.join(tmp2, "s"))
+                    v = detect.Verdict(score=100, severity="critical",
+                                        findings=[detect.Finding(
+                                            "R01-relay-binary", "t", 100,
+                                            "critical",
+                                            subjects=[{"pid": child.pid}])],
+                                        reasons=[])
+                    res = respond.respond(cfg, v, log=None)
+                    m = os.stat(victim).st_mode & 0o777
+                    assert m == 0o755, f"mode={mode!r} chmod'ed to {oct(m)}"
+                    assert not res.acted or mode == "Contian", (
+                        f"mode={mode!r} acted: {[a.to_dict() for a in res.actions]}"
+                    )
+            finally:
+                child.kill()
+                shutil.rmtree(tmp2, ignore_errors=True)
+            return True, "5 mode strings, all inert in observe"
+
+        suite.check("SAFETY: observe mode never chmods, whatever the mode string",
+                    t_contain_never_chmods_in_observe)
+
+        def t_cmdline_corpus():
+            """No cmdline signature may fire on ordinary work.
+
+            Found in review: "grep -rn botnet ~/notes" scored 90 and made
+            /usr/bin/grep a chmod target. The corpus covers greps, commits,
+            editors and browsers, not just proxy tools.
+            """
+            fps = signatures.cmdline_false_positives()
+            assert not fps, f"cmdline signatures fire on benign input: {fps}"
+            return True, f"{len(signatures.BENIGN_CMDLINES)} benign command lines clean"
+
+        suite.check("SAFETY: no cmdline signature fires on ordinary commands",
+                    t_cmdline_corpus)
+
+        def t_real_relays_still_detected():
+            """The corpus must not have been satisfied by deleting the rules."""
+            must_fire = {
+                "socat TCP-LISTEN:1080,fork,reuseaddr TCP:x:1080": "socat-listen",
+                "gost -L socks5://:1080": "socks5-url-arg",
+                "curl --socks5 1.2.3.4:1080 http://x": "socks-serve-flag",
+                "tun2socks -t tun0 -u socks5://127.0.0.1:1080": "socks5-url-arg",
+            }
+            missing = []
+            for cmd, expected in must_fire.items():
+                sig = signatures.match_cmdline(cmd)
+                if sig is None or sig.name != expected:
+                    missing.append((cmd, sig.name if sig else None, expected))
+            assert not missing, f"real relay invocations no longer detected: {missing}"
+            for exe in ("dante", "3proxy", "gost", "frpc", "ngrok", "sing-box",
+                        "xray", "microsocks", "ss-server"):
+                assert signatures.match_exe(exe), f"lost exe signature: {exe}"
+            return True, f"{len(must_fire)} relay invocations and 9 exe names still detected"
+
+        suite.check("SAFETY: real relay invocations still detected",
+                    t_real_relays_still_detected)
+
+        def t_generic_exe_prefixes():
+            """A vendor prefix must not match unrelated programs."""
+            must_not = ["ps_check", "ps_report", "ps_mem", "ps_sync", "psql",
+                        "postscript", "frp_thing", "chisel-fork", "geonode-map"]
+            bad = [(n, signatures.match_exe(n).name) for n in must_not
+                   if signatures.match_exe(n)]
+            assert not bad, f"generic names matched a vendor signature: {bad}"
+            must = ["packetstream", "packetstream-agent", "chisel", "frpc", "frps"]
+            missed = [n for n in must if not signatures.match_exe(n)]
+            assert not missed, f"real vendor names lost: {missed}"
+            return True, f"{len(must_not)} generic names clean, {len(must)} vendor names match"
+
+        suite.check("SAFETY: vendor exe prefixes are anchored",
+                    t_generic_exe_prefixes)
+
+        def t_tor_client_not_flagged():
+            """Tor as a client is not a relay.
+
+            Found in review: 'ExitRelay' is compiled into /usr/bin/tor itself,
+            so the byte scan flagged a legitimate client at score 80 and made
+            it a chmod target. Relay configuration is R08's job, read from
+            torrc.
+            """
+            hits = signatures.scan_bytes(util.read_bytes("/usr/bin/tor"), "tor")
+            assert not hits, f"tor flagged by its own compiled-in strings: {hits}"
+            assert signatures.is_protected("tor"), "tor must be protected from targeting"
+            return True, "tor clean as a client"
+
+        suite.check("SAFETY: a Tor client is not a Tor relay",
+                    t_tor_client_not_flagged)
+
+        def t_no_dead_signatures():
+            """No signature may be permanently inert.
+
+            Found in review: R01 gated on score >= 80, so eight of the thirteen
+            cmdline rules could never produce a finding at all.
+            """
+            inert = [s.name for s in signatures.CMDLINE_SIGS if s.score >= 55]
+            assert inert, "no sub-80 signatures to corroborate with"
+            proc = observe.Proc(pid=99997, ppid=1, uid=1000, exe="/usr/bin/socat",
+                                exe_base="socat",
+                                cmdline="socat TCP-LISTEN:1080,fork,reuseaddr TCP:evil:1080")
+            proc.sig_hits = [
+                {"name": s.name, "score": s.score, "why": s.why}
+                for s in signatures.CMDLINE_SIGS
+                if s.score >= 55
+            ]
+            findings = detect.rule_relay_binary([proc])
+            assert findings, "two independent sub-80 signatures produced no finding"
+            assert findings[0].detail["corroborated"], findings[0].detail
+            return True, (
+                f"corroborated {len(proc.sig_hits)} signatures -> score "
+                f"{findings[0].score}"
+            )
+
+        suite.check("SAFETY: sub-threshold signatures corroborate instead of dying",
+                    t_no_dead_signatures)
+
+        def t_p2p_clients_not_targets():
+            """A BitTorrent seeder is not a proxy.
+
+            Found in review: R05's thresholds are the normal shape of a seeder,
+            and R05 is in the target list for freeze and chmod.
+            """
+            for exe in ("qbittorrent-nox", "transmission-daemon", "deluge-web",
+                        "rtorrent", "syncthing"):
+                assert exe in detect._HIGH_FANOUT_OK, f"{exe} not allowlisted"
+            proc = observe.Proc(pid=99996, ppid=1, uid=1000,
+                                exe=f"/usr/bin/qbittorrent-nox",
+                                exe_base="qbittorrent-nox", cmdline="qbittorrent-nox")
+            proc.conns = [
+                observe.Socket(proto="tcp", local="10.0.0.2", local_port=40000 + i,
+                               remote=f"45.{i}.{(i * 7) % 250}.{(i * 3) % 250}",
+                               remote_port=51413, state="ESTABLISHED",
+                               uid=1000, inode=0)
+                for i in range(60)
+            ]
+            assert not detect.rule_connection_fanout([proc], {}),                 "qbittorrent flagged for fan-out"
+            return True, "5 P2P clients allowlisted, seeder with 60 peers stays quiet"
+
+        suite.check("SAFETY: P2P clients are not relay candidates",
+                    t_p2p_clients_not_targets)
+
+        def t_quarantine_respects_loopback_and_allowlist():
+            """A port quarantine must not break the machine's own services."""
+            script = firewall.render_quarantine([53, 1716, 1080], allow=[1716])
+            assert 'iifname "lo"' in script, "no loopback exemption"
+            assert "tcp dport 1716 counter accept" in script, "allowlisted port dropped"
+            assert "tcp dport 53 counter drop" in script, "target port not dropped"
+            # order matters: accepts must precede the drops
+            lo = script.index('iifname "lo"')
+            allow = script.index("ward:quarantine-lan-allow")
+            # Match the exact comment, not the prefix: "ward:quarantine-lo"
+            # contains "ward:quarantine".
+            drop = script.index('comment "ward:quarantine"')
+            assert lo < allow < drop, (
+                f"exemptions must precede the drops: lo={lo} allow={allow} drop={drop}"
+            )
+            return True, "loopback + allowlist exempt and correctly ordered"
+
+        suite.check("SAFETY: port quarantine exempts loopback and the allowlist",
+                    t_quarantine_respects_loopback_and_allowlist)
+
+        def t_quarantine_needs_action_threshold():
+            """A sub-threshold finding must not quarantine anything."""
+            class _C:
+                def get(self, dotted, default=None):
+                    return {"respond.contain_score": 70,
+                            "firewall.lan_allowlist": [1716],
+                            "firewall.lan_allowlist_udp": [1716],
+                            "identity.trusted_lan_cidr": "192.168.0.0/16"}.get(dotted, default)
+                def section(self, _n):
+                    return {}
+            low = detect.Verdict(
+                score=40, severity="medium",
+                findings=[detect.Finding("R03-world-listener", "dnsmasq", 40,
+                                         "medium",
+                                         detail={"port": 53},
+                                         subjects=[{"port": 53}])],
+                reasons=[])
+            src = pathlib.Path(__file__).with_name("respond.py").read_text()
+            assert "if f.score >= contain_score" in src, \
+                "respond() does not gate ports on the action threshold"
+            return True, "ports are gated on respond.contain_score"
+
+        suite.check("SAFETY: port quarantine requires the action threshold",
+                    t_quarantine_needs_action_threshold)
+
+        def t_baseline_key_survives_ipv6():
+            """A listener key must survive an IPv6 address and a DHCP change."""
+            v4 = observe.Socket(proto="tcp", local="192.168.68.60", local_port=1716,
+                                remote="0.0.0.0", remote_port=0, state="LISTEN",
+                                uid=0, inode=0, exe="/usr/bin/kdeconnectd")
+            v6 = observe.Socket(proto="tcp6", local="::1", local_port=5353,
+                                remote="::", remote_port=0, state="LISTEN",
+                                uid=0, inode=0, exe="/usr/bin/avahi-daemon")
+            v6b = observe.Socket(proto="tcp6", local="::", local_port=5355,
+                                 remote="::", remote_port=0, state="LISTEN",
+                                 uid=0, inode=0, exe="/usr/bin/systemd-resolved")
+            state = observe.baseline_state({}, [], [v4, v6, v6b])
+            stored = {"listeners": state["listeners"]}
+            changed = observe.baseline_state({}, [], [v4])
+            findings = detect.rule_baseline_diff(changed, stored)
+            offenders = [f for f in findings if "world-reachable" in f.title]
+            assert not offenders, (
+                f"a loopback IPv6 listener was treated as world-reachable: "
+                f"{[f.to_dict() for f in offenders]}"
+            )
+            assert len(state["listeners"]) == 3, state["listeners"]
+            return True, f"3 listener keys, no IPv6 misparse"
+
+        suite.check("SAFETY: baseline keys survive IPv6 and a DHCP change",
+                    t_baseline_key_survives_ipv6)
+
+        # ============ end safety properties ============
         def t_content_scan_real_binaries():
             """Anti-false-positive regression.
 

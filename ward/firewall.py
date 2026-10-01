@@ -157,7 +157,8 @@ def render(config) -> str:
     return "\n".join(L) + "\n"
 
 
-def render_quarantine(ports: Iterable[int], table: str = "ward_quarantine") -> str:
+def render_quarantine(ports: Iterable[int], table: str = "ward_quarantine",
+                      allow: Iterable[int] = (), lan_cidr: str = "192.168.0.0/16") -> str:
     """A standalone table that drops traffic to specific ports outright.
 
     Used by the responder to make a relaying port dead immediately, even before
@@ -166,7 +167,16 @@ def render_quarantine(ports: Iterable[int], table: str = "ward_quarantine") -> s
     ports = sorted({int(p) for p in ports if p})
     L = [f"table inet {table} {{", f"    chain {table}_input {{",
          f"        type filter hook input priority filter - 10; policy accept;",
-         "        ct state established,related counter accept"]
+         "        ct state established,related counter accept",
+         # Loopback and the operator's allowlist survive. Quarantining a port
+         # must stop the relay, not break the machine's own services or the
+         # one thing the operator deliberately opened.
+         '        iifname "lo" counter accept comment "ward:quarantine-lo"']
+    for port in allow:
+        L.append(
+            f"        ip saddr {lan_cidr} tcp dport {port} counter accept "
+            f'comment "ward:quarantine-lan-allow"'
+        )
     for port in ports:
         L.append(f"        tcp dport {port} counter drop comment \"ward:quarantine\"")
         L.append(f"        udp dport {port} counter drop comment \"ward:quarantine\"")
@@ -256,14 +266,20 @@ def remove(table: str = TABLE, family: str = "inet") -> tuple[bool, str]:
     return True, f"removed table {family} {table}"
 
 
-def quarantine_ports(ports: Iterable[int], table: str = "ward_quarantine") -> tuple[bool, str]:
+def quarantine_ports(ports: Iterable[int], table: str = "ward_quarantine",
+                     config=None) -> tuple[bool, str]:
     if not util.is_root():
         return False, "requires root"
     ports = list(ports)
     if not ports:
         return True, "nothing to quarantine"
+    allow: list[int] = []
+    cidr = "192.168.0.0/16"
+    if config is not None:
+        allow = [int(p) for p in config.get("firewall.lan_allowlist", [])]
+        cidr = config.get("identity.trusted_lan_cidr", cidr)
     _nft(render_unquarantine(table))
-    rc, _, err = _nft(render_quarantine(ports, table))
+    rc, _, err = _nft(render_quarantine(ports, table, allow, cidr))
     if rc != 0:
         return False, err.strip()
     return True, f"quarantined ports {sorted(set(ports))} in table inet {table}"

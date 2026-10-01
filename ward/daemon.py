@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import detect, firewall, harden, respond, util
+from . import detect, firewall, harden, observe, respond, util
 from .config import Config
 from .events import EventLog
 from .util import now
@@ -54,7 +54,17 @@ class Runtime:
             return default
 
     def load_baseline(self) -> dict:
-        return self._load_json(self.config.get("baseline.file"), {}) or {}
+        data = self._load_json(self.config.get("baseline.file"), {}) or {}
+        if data and data.get("schema") != observe.BASELINE_SCHEMA:
+            self.log.emit(
+                "baseline-reset",
+                {"stored_schema": data.get("schema"),
+                 "current_schema": observe.BASELINE_SCHEMA},
+                title="baseline schema changed; re-learning instead of "
+                      "reporting every listener as new",
+            )
+            return {}
+        return data
 
     def save_baseline(self, data: dict) -> None:
         try:

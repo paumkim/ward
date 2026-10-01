@@ -69,15 +69,19 @@ def rule_relay_binary(procs: list[Proc]) -> list[Finding]:
     """R01: a known relay/proxy/residential-network binary is running."""
     out: list[Finding] = []
     for proc in procs:
+        # A single signature at or above 80 is decisive. Below that, two
+        # independent signatures on the same process corroborate each other.
+        # A magic threshold alone made eight of the thirteen cmdline rules
+        # permanently inert, which meant the cmdline layer contributed nothing
+        # for exactly the dual-use tools it was written for.
         strong = [h for h in proc.sig_hits if h.get("score", 0) >= 80]
-        vendor = [
-            h for h in strong
-            if h["name"] in {s.name for s in signatures.EXE_SIGS if s.score >= 90}
-        ]
-        if not (strong or vendor):
+        independent = {h["name"] for h in proc.sig_hits if h.get("score", 0) >= 55}
+        corroborated = len(independent) >= 2
+        if not strong and not corroborated:
             continue
         listening_ext = [s for s in proc.listeners if s.world_reachable]
-        score = max(h.get("score", 0) for h in strong)
+        best = max(h.get("score", 0) for h in proc.sig_hits)
+        score = best + (10 if corroborated and best < 80 else 0)
         if listening_ext:
             score = min(100, score + 10)
         out.append(
@@ -89,7 +93,8 @@ def rule_relay_binary(procs: list[Proc]) -> list[Finding]:
                 detail={
                     "exe": proc.exe,
                     "cmdline": util.truncate(proc.cmdline, 300),
-                    "hits": strong,
+                    "hits": proc.sig_hits,
+                    "corroborated": corroborated,
                     "listening": [s.key for s in proc.listeners],
                     "world_reachable": [s.key for s in listening_ext],
                     "cwd": proc.cwd,
@@ -289,6 +294,16 @@ _HIGH_FANOUT_OK = {
     "plocate", "pip", "uv", "bun", "node", "deno", "cargo", "rustc", "go",
     "docker", "podman", "flatpak", "zypak", "steam", "lutris", "heroic",
     "curl", "wget", "rsync", "scp", "sftp", "git", "borg", "restic",
+    # P2P file transfer: a seeder holding 25+ peers across many /16s is
+    # ordinary use, not a relay. Freezing one of these would be a disaster.
+    "qbittorrent-nox", "qbittorrent", "transmission-daemon", "transmission-cli",
+    "transmission-remote", "deluge", "deluge-web", "deluged", "rtorrent",
+    "aria2c", "syncthing", "rclone", "restic", "restic_1", "zsync",
+    "nicotine", "nzbget", "sabnzbd", "hydra", "king Torrent", "ktorrent",
+    # infra that legitimately talks to many hosts at once
+    "docker", "podman", "containerd", "podman-healthcheck", "kubelet",
+    "systemd-resolved", "resolved", "dhclient", "dhcpcd", "wpa_supplicant",
+    "NetworkManager", "nm-openvpn", "nm-online", "keepalived",
 }
 
 
@@ -361,14 +376,25 @@ def rule_forwarding(host: observe.HostState) -> list[Finding]:
             )
         )
     if host.masquerade_rules:
+        # Scored low on purpose. Docker, Podman and libvirt all create
+        # masquerade rules, so a 55 here put every container host permanently
+        # in the high band with nothing the operator could do about it.
+        # Masquerade becomes evidence only next to forwarding.
         out.append(
             Finding(
                 rule="R07-masquerade",
                 title=f"{host.masquerade_rules} NAT masquerade rule(s) present",
-                score=55,
-                severity="high",
-                detail={"count": host.masquerade_rules,
-                        "why": "masquerade is how a shared uplink is sold"},
+                score=20 if host.ip_forward == 0 else 40,
+                severity="low" if host.ip_forward == 0 else "medium",
+                detail={
+                    "count": host.masquerade_rules,
+                    "ip_forward": host.ip_forward,
+                    "why": "normal on a Docker/VM host; only meaningful "
+                           "together with ip_forward=1",
+                    "note": "counted as a raw substring across the whole "
+                            "ruleset, so this is a presence indicator, not an "
+                            "inventory of NAT rules",
+                },
                 subjects=[{"nft": "masquerade"}],
             )
         )
@@ -606,9 +632,13 @@ def rule_baseline_diff(state: dict[str, Any], stored: dict[str, Any]) -> list[Fi
     old_listeners = set(stored.get("listeners", []))
     new_listeners = [l for l in state.get("listeners", []) if l not in old_listeners]
     for entry in new_listeners:
-        parts = entry.split(":")
-        port = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
-        world = len(parts) > 1 and not util.is_loopback(parts[1])
+        parts = entry.split("|")
+        port = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        # Splitting on ':' broke every IPv6 listener, because '::1' contains
+        # colons: parts[1] was '' and is_loopback('') is False, so a loopback
+        # IPv6 socket scored world-reachable.
+        local = parts[1] if len(parts) > 1 else ""
+        world = bool(local) and not util.is_loopback(local)
         if not world:
             continue
         out.append(
@@ -623,7 +653,7 @@ def rule_baseline_diff(state: dict[str, Any], stored: dict[str, Any]) -> list[Fi
         )
     old_procs = set(stored.get("processes", []))
     new_procs = [p for p in state.get("processes", []) if p not in old_procs]
-    relay_ish = [p for p in new_procs if signatures.match_exe(p.split(":")[0])]
+    relay_ish = [p for p in new_procs if signatures.match_exe(p.split("|")[0])]
     for entry in relay_ish:
         out.append(
             Finding(

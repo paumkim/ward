@@ -213,6 +213,25 @@ def _load_file(path: str) -> dict:
         return {}
 
 
+VALID_MODES = ("observe", "contain", "kill", "lockdown")
+
+
+def normalise_mode(raw: Any) -> str:
+    """Coerce a response mode to a valid one, failing closed.
+
+    This function exists because of a real incident: `respond()` gated its
+    destructive actions on `mode == "observe"`, so any typo ("Observe",
+    "observ", "Contian", a trailing space from a TOML edit) fell through to
+    `chmod 000` on the target binary. A defence tool must never do more than
+    asked because of a spelling mistake, so anything unrecognised becomes
+    `observe`.
+    """
+    text = str(raw or "").strip().lower()
+    if text in VALID_MODES:
+        return text
+    return "observe"
+
+
 class Config:
     def __init__(self, data: dict[str, Any], sources: list[str]):
         self.data = data

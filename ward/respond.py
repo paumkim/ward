@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import firewall, harden, signatures, util
+from .config import VALID_MODES, normalise_mode
 from .detect import Finding, Verdict
 from .util import now, run
 
@@ -310,6 +311,12 @@ def kill_process_tree(pid: int, grace: float = 3.0, dry_run: bool = False) -> li
 # ------------------------------------------------------------------ lockdown
 
 
+def _allow_lan_ports(config) -> set[int]:
+    return {int(p) for p in config.get("firewall.lan_allowlist", [])} | {
+        int(p) for p in config.get("firewall.lan_allowlist_udp", [])
+    }
+
+
 def lockdown(config, journal: harden.Journal | None = None,
              dry_run: bool = False) -> Response:
     """Maximum containment: nothing inbound, no forwarding, relay ports dead."""
@@ -320,7 +327,9 @@ def lockdown(config, journal: harden.Journal | None = None,
         return res
     util.require_root("lockdown")
 
-    ok, msg = firewall.quarantine_ports(sorted(signatures.RELAY_PORTS))
+    ok, msg = firewall.quarantine_ports(
+        sorted(signatures.RELAY_PORTS - _allow_lan_ports(config)), config=config
+    )
     res.actions.append(Action("quarantine-relay-ports", ok, msg))
 
     fw = config.section("firewall")
@@ -392,11 +401,29 @@ def _target_pids(verdict: Verdict, config) -> list[int]:
 
 
 def respond(config, verdict: Verdict, log=None, dry_run: bool = False) -> Response:
-    """The decision point. Every action taken is returned, not hidden."""
+    """The decision point. Every action taken is returned, not hidden.
+
+    Three independent gates must all pass before anything destructive runs. A
+    defence tool that fires because of a config typo, a dry-run flag, or a
+    loose mode comparison is worse than no defence tool.
+    """
     cfg = config.section("respond")
-    mode = cfg.get("mode", "observe")
+    raw_mode = cfg.get("mode", "observe")
+    mode = normalise_mode(raw_mode)
     res = Response(mode=mode)
-    if mode == "observe" and not dry_run:
+
+    if mode != normalise_mode(raw_mode) and str(raw_mode).strip() != mode:
+        res.actions.append(
+            Action("mode-rejected", True,
+                   f"response mode {raw_mode!r} is not one of "
+                   f"{', '.join(VALID_MODES)}; falling back to observe")
+        )
+    if mode == "observe":
+        return res
+    if dry_run:
+        res.actions.append(
+            Action("dry-run", True, "dry run: no system state was changed")
+        )
         return res
 
     snap_label = mode if mode != "observe" else "scan"
@@ -410,18 +437,29 @@ def respond(config, verdict: Verdict, log=None, dry_run: bool = False) -> Respon
             res.actions.append(Action("snapshot", False, str(exc)))
 
     pids = _target_pids(verdict, config)
+    contain_score = config.get("respond.contain_score", 70)
+    allow_lan = {
+        p for p in config.get("firewall.lan_allowlist", [])
+    } | {p for p in config.get("firewall.lan_allowlist_udp", [])}
+    # Only findings that actually met the action threshold, and never a port
+    # the operator allowlisted. Previously a score-40 finding on a
+    # world-bound dnsmasq:53 was enough to drop all inbound 53 including from
+    # loopback and the LAN.
     ports = sorted(
         {
             s["port"]
             for f in verdict.findings
-            if f.rule in ("R03-world-listener", "R04-world-udp-listener", "R11-new-world-listener")
+            if f.score >= contain_score
+            and f.rule in ("R03-world-listener", "R04-world-udp-listener",
+                           "R11-new-world-listener")
             for s in f.subjects
             if isinstance(s, dict) and isinstance(s.get("port"), int)
+            and s["port"] not in allow_lan
         }
     )
 
     if mode in ("contain", "kill", "lockdown") and ports:
-        ok, msg = firewall.quarantine_ports(ports)
+        ok, msg = firewall.quarantine_ports(ports, config=config)
         res.actions.append(Action("port-quarantine", ok, msg))
 
     for pid in pids:

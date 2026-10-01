@@ -54,10 +54,10 @@ EXE_SIGS: list[Sig] = [
     Sig("privoxy", "exe", r"^privoxy$", 70, "HTTP(S) filtering proxy"),
     Sig("squid", "exe", r"^squid$", 80, "caching proxy"),
     Sig("gost", "exe", r"^gost$|^gost\.?v?\d*$", 90, "GOST relay/proxy"),
-    Sig("frp", "exe", r"^frpc$|^frps$|^frpc?_\w+$", 90, "FRP tunnel client/server"),
+    Sig("frp", "exe", r"^(frpc|frps)(\.exe)?$", 90, "FRP tunnel client/server"),
     Sig("ngrok", "exe", r"^ngrok$", 90, "ngrok tunnel agent"),
     Sig("cloudflared", "exe", r"^cloudflared$", 75, "Cloudflare tunnel connector"),
-    Sig("chisel", "exe", r"^chisel", 85, "chisel TCP/UDP tunnel over HTTP"),
+    Sig("chisel", "exe", r"^chisel(-client)?$", 85, "chisel TCP/UDP tunnel over HTTP"),
     Sig("ncat-nc", "exe", r"^ncat$|^netcat$|^nc\.openbsd$|^nc$", 60, "netcat (relay-capable)"),
     Sig("socat", "exe", r"^socat$", 55, "socat (relay-capable)"),
     Sig("rinetd", "exe", r"^rinetd$", 90, "port forwarder"),
@@ -75,15 +75,15 @@ EXE_SIGS: list[Sig] = [
     Sig("redsocks", "exe", r"^redsocks$", 60, "redirector into a SOCKS proxy"),
     Sig("ss-local-tor", "exe", r"^ss-local$", 80, "socks client into a tunnel"),
     Sig("proxychains", "exe", r"^proxychains4?$", 30, "proxychains client (local only)"),
-    Sig("resiproxy", "exe", r"^resiproxy$|^resi.*proxy$", 95, "residential proxy agent"),
-    Sig("brightdata", "exe", r"^brightdata|bright-data|brightdata_", 95, "Bright Data agent"),
+    Sig("resiproxy", "exe", r"^resi[-_]?proxy$", 95, "residential proxy agent"),
+    Sig("brightdata", "exe", r"^(bright[-_]?data|brightdata)[-_]?\w*$", 95, "Bright Data agent"),
     Sig("oxylabs", "exe", r"^oxylabs|oxy-?proxy", 95, "Oxylabs agent"),
     Sig("iproyal", "exe", r"^iproyal", 95, "IPRoyal agent"),
     Sig("smartproxy", "exe", r"^smartproxy$|^smart_?proxy_?agent", 95, "Smartproxy agent"),
     Sig("webshare", "exe", r"^webshare", 95, "Webshare agent"),
-    Sig("netnut", "exe", r"^netnut", 95, "NetNut agent"),
-    Sig("geonode", "exe", r"^geonode", 90, "Geonode agent"),
-    Sig("packetstream", "exe", r"^packetstream|^ps_\w+", 95, "PacketStream proxy"),
+    Sig("netnut", "exe", r"^netnut(-agent)?$", 95, "NetNut agent"),
+    Sig("geonode", "exe", r"^geonode(-agent)?$", 90, "Geonode agent"),
+    Sig("packetstream", "exe", r"^packetstream(-agent)?$", 95, "PacketStream proxy"),
     Sig("pawnacle", "exe", r"^pawnacle", 95, "Pawnacle agent"),
     Sig("tensortrader", "exe", r"^tensor.?trader", 90, "residential proxy trader"),
     Sig("proxidize", "exe", r"^proxidize", 95, "Proxidize proxy stack"),
@@ -93,29 +93,105 @@ EXE_SIGS: list[Sig] = [
 
 # ------------------------------------------------------------------ cmdline
 # A process that is *invoked* as a proxy, whatever the binary is called.
+#
+# Flag-shaped patterns only. Word-matching over the whole command line is a
+# false-positive machine: "grep -rn botnet ~/notes" put /usr/bin/grep at score
+# 90, and in contain mode that is chmod 000 on grep. Every pattern below has
+# to be able to match an option, not arbitrary prose the user is searching for.
 CMDLINE_SIGS: list[Sig] = [
-    Sig("socks-serve-flag", "cmdline", r"(--socks-port|--socks5|-l\s*\d+\s*--socks)", 85,
+    Sig("socks-serve-flag", "cmdline", r"(--socks-port|--socks5\b|-l\s*\d+\s*--socks)", 85,
         "SOCKS server flag"),
-    Sig("botnet-word", "cmdline", r"\b(botnet|botnet_?node|bot[-_ ]?master|slave[-_ ]?node)\b", 90,
-        "cmdline mentions botnet roles"),
-    Sig("http-proxy-flag", "cmdline", r"(--http-port|http_proxy_port|--proxy-port)", 60,
-        "HTTP proxy port flag"),
-    Sig("redir-flag", "cmdline", r"(--redir\s+|--redirect\s+http)", 55, "redirection flag"),
-    Sig("tun-flag", "cmdline", r"(--tun\s+--|\-interface\s+tun|setup_tun)", 55, "TUN device setup"),
-    Sig("tun2socks", "cmdline", r"tun2socks|hev-socks5-tunnel", 70, "tun-to-socks bridge"),
-    Sig("socat-listen", "cmdline", r"TCP-LISTEN|UDP4-LISTEN|UNIX-LISTEN|LISTEN:", 60,
-        "socat-style listener in the command line"),
-    Sig("fork-relay", "cmdline", r",fork[,)]|reuseaddr", 35, "forking listener flags"),
-    Sig("relay-word", "cmdline", r"\b(socks5?[-_ ]?server|proxy[-_ ]?server|residential[-_ ]?proxy)\b",
-        70, "cmdline advertises a proxy server"),
-    Sig("sell-word", "cmdline", r"\b(sell|monetize|share)[\s_-]+(my[\s_-]+)?(bandwidth|traffic|internet)\b",
-        80, "cmdline mentions selling bandwidth"),
-    Sig("botnet-word", "cmdline", r"\b(botnet|botnet_?node|bot[-_ ]?master|slave[-_ ]?node)\b", 90,
-        "cmdline mentions botnet roles"),
-    Sig("peer2peer-share", "cmdline", r"--(share|lease)[-_ ]bandwidth|bandwidth[-_ ]share", 80,
+    Sig("socks5-url-arg", "cmdline", r"\b(socks5|socks4)://", 70,
+        "SOCKS URL passed to the program"),
+    Sig("sell-word", "cmdline", r"\b(sell|monetize|lease)[-_ ]bandwidth\b"
+                            r"|\bbandwidth[-_](sale|share|monetiz)", 75,
+        "cmdline mentions selling bandwidth"),
+    Sig("peer2peer-share", "cmdline", r"--(share|lease)[-_ ]bandwidth", 75,
         "bandwidth sharing flag"),
-    Sig("wg-quick-up", "cmdline", r"wg-quick\s+up", 20, "WireGuard interface up"),
+    Sig("http-proxy-flag", "cmdline", r"(--http-port|http_proxy_port|--proxy-port)", 70,
+        "HTTP proxy port flag"),
+    Sig("tun2socks", "cmdline", r"\b(tun2socks|hev-socks5-tunnel)\b", 70,
+        "tun-to-socks bridge"),
+    Sig("socat-listen", "cmdline", r"\b(TCP|UDP4|UDP6|UNIX)-LISTEN\b", 60,
+        "socat-style listener in the command line"),
+    Sig("relay-word", "cmdline", r"\b(socks5?[-_ ]?server|proxy[-_ ]?server"
+                              r"|residential[-_ ]?proxy)\b", 60,
+        "cmdline advertises a proxy server"),
+    Sig("redir-flag", "cmdline", r"(--redir\s+|--redirect\s+http)", 60, "redirection flag"),
+    Sig("tun-flag", "cmdline", r"(--tun\s+--|--interface\s+tun|--setup-tun)", 60,
+        "TUN device setup"),
+    Sig("fork-relay", "cmdline", r",fork[,)]|\breuseaddr\b", 40, "forking listener flags"),
+    Sig("wg-quick-up", "cmdline", r"\bwg-quick\s+up\b", 20, "WireGuard interface up"),
 ]
+
+#: Cmdline patterns that are matched as bare English words. Kept separate so a
+#: future edit cannot quietly reintroduce "search for the word botnet and get
+#: your grep binary flagged". Each must be corroborated before it can act.
+CMDLINE_WORD_SIGS: list[Sig] = [
+    Sig("botnet-word", "cmdline", r"\b(botnet|bot[-_ ]?master|slave[-_ ]?node)\b", 90,
+        "cmdline names a botnet role"),
+]
+
+#: How much corroboration a bare-word cmdline hit needs before it may act on
+#: anything. A word in an argument list is not evidence on its own.
+WORD_SIG_NEEDS_NETWORK = True
+
+
+#: Benign command lines that a cmdline signature must never match. This is a
+#: behavioural corpus, not a structural guess: the question is not "does the
+#: pattern look like a flag" but "does it fire on something a user would
+#: actually type". It grew because of a real incident -- "grep -rn botnet"
+#: flagged /usr/bin/grep at score 90.
+BENIGN_CMDLINES = [
+    "grep -rn botnet ~/notes",
+    "grep -i 'proxy server' ~/syslog",
+    "/usr/lib/firefox/firefox https://en.wikipedia.org/wiki/Botnet",
+    "man botnet",
+    "man socks",
+    "vim notes.md",
+    "git commit -m 'remove residential proxy from firewall rules'",
+    "git checkout share_traffic_notes",
+    "rg --type md bandwidth",
+    "curl -s https://example.com/proxy",
+    "firefox --new-window https://news.ycombinator.com",
+    "opencode run 'review the proxy code'",
+    "python3 -m ward selftest",
+    "python3 monitor_hosts.py --threads 8",
+    "tor --version",
+    "tor -f /etc/tor/torrc",
+    "torsocks firefox",
+    "ssh -N -D 1080 jump.example.com",
+    "rsync -avz --progress src/ dst/",
+    "pacman -Syu",
+    "systemctl restart systemd-resolved",
+    "obsidian /home/pauk/notes/Botnet research.md",
+    "cat /etc/tor/torrc",
+    "nvim -c 'set ft=markdown' README.md",
+    "soffice --headless --convert-to pdf report.docx",
+    "npm run dev -- --port 3000",
+    "kubectl get pods -n monitoring",
+    "ansible-playbook site.yml --limit web01",
+    "pdftotext -layout paper.pdf out.txt",
+    "grep -c 'socks5://' /etc/config",
+]
+
+
+def cmdline_false_positives(sigs: list[Sig] | None = None) -> list[tuple[str, str]]:
+    """(signature, benign command line) pairs that must not match.
+
+    Run by the self-test on every change to this file.
+    """
+    # Goes through match_cmdline(), not a bare regex search, so the test
+    # exercises the same code path production uses. An earlier version searched
+    # the pattern directly and reported false positives that match_cmdline()
+    # does not actually produce.
+    hits: dict[str, str] = {}
+    for line in BENIGN_CMDLINES:
+        sig = match_cmdline(line)
+        if sig is not None:
+            hits.setdefault(sig.name, line)
+    return list(hits.items())
+
 
 # ------------------------------------------------------------------ paths
 # Files that should not exist on a machine that is not a relay.
@@ -151,7 +227,6 @@ TIER_A: list[tuple[str, bytes, int, str]] = [
     ("gost-relay", b"gost -L", 85, "GOST relay listener flags"),
     ("shadowsocks", b"shadowsocks", 80, "shadowsocks strings"),
     ("sing-box", b"sing-box", 75, "sing-box proxy core"),
-    ("tor-exit-relay", b"ExitRelay", 80, "Tor ExitRelay directive"),
     ("socks5-auth-protocol", b"SOCKS5 authentication", 80, "SOCKS5 auth negotiation"),
     ("socks-proxy-service", b"SOCKS proxy", 60, "SOCKS proxy service handling"),
 ]
@@ -187,6 +262,10 @@ BENIGN_CONTENT = {
     "python3", "python", "node", "bun", "deno", "ruby", "perl", "java",
     "opencode", "term", "code", "electron", "gnome-shell", "plasmashell",
     "ssh", "curl", "wget", "git", "pacman", "systemd", "resolved", "nm",
+    # Tor as a *client* is not a relay. R08 reads torrc, which is the correct
+    # detector for relay configuration; byte-matching tor's own option names
+    # proves nothing.
+    "tor", "torsocks", "nyx", "tortoise-git", "meek", "obfs4proxy",
     # mail / editors / tools that legitimately understand SOCKS URLs
     "thunar", "dolphin", "nautilus", "gwenview", "okular", "kmail", "mutt",
     "neomutt", "ranger", "yazi", "rsync", "curl", "aria2c", "wget2",
@@ -226,6 +305,7 @@ PROTECTED_EXES = {
     "firewalld", "nft", "iptables", "ip", "sshd", "ssh", "sudo", "su",
     "sudoers", "polkitd", "packagekitd", "pacman", "bash", "zsh", "fish",
     "kdeconnectd", "rtkit-daemon", "pipewire", "wireplumber", "pulseaudio",
+    "tor", "torsocks", "nyx",
     "dbus-daemon", "Xorg", "Xwayland", "kwin_wayland", "kwin_x11",
     "gnome-keyring-daemon", "kscreenlocker", "fprintd", "upowerd",
     "ward", "python3.14", "python3.13", "python3.12",
@@ -267,6 +347,7 @@ VENDOR_TEXT_RX = re.compile(
 
 EXE_RX = [(s, _rx(s.pattern)) for s in EXE_SIGS]
 CMDLINE_RX = [(s, _rx(s.pattern)) for s in CMDLINE_SIGS]
+CMDLINE_WORD_RX = [(s, _rx(s.pattern)) for s in CMDLINE_WORD_SIGS]
 PATH_RX = [(s, _rx(s.pattern)) for s in PATH_SIGS]
 
 
@@ -278,11 +359,45 @@ def match_exe(name: str) -> Sig | None:
     return None
 
 
+#: Matches a single- or double-quoted span, including one that opened earlier
+#: on the line.
+_QUOTED = re.compile(r"""('[^']*'|"[^"]*")""", re.S)
+
+
+def strip_quoted(cmd: str) -> str:
+    """Blank out quoted spans so they cannot match a signature.
+
+    Quoted text is data, not invocation. "grep -c 'socks5://' /etc/config" is
+    a search for a string, and "git commit -m 'remove residential proxy'" is
+    a commit message. Three of the false positives found by the benign corpus
+    were both of those. Replacing the span with a placeholder keeps argument
+    positions intact so "gost -L socks5://:1080" still matches.
+    """
+    return _QUOTED.sub(lambda m: "\x00" * len(m.group(0)), cmd)
+
+
 def match_cmdline(cmd: str) -> Sig | None:
+    """Strongest flag-shaped match in a command line.
+
+    Returns None for a bare-word hit. Those are surfaced separately by
+    match_cmdline_word(), which the detector treats as uncorroborated.
+    """
+    haystack = strip_quoted(cmd)
+    best: Sig | None = None
     for sig, rx in CMDLINE_RX:
-        if rx.search(cmd):
-            return sig
-    return None
+        if rx.search(haystack) and (best is None or sig.score > best.score):
+            best = sig
+    return best
+
+
+def match_cmdline_word(cmd: str) -> Sig | None:
+    """A bare word in an argument list. Never sufficient on its own."""
+    haystack = strip_quoted(cmd)
+    best: Sig | None = None
+    for sig, rx in CMDLINE_WORD_RX:
+        if rx.search(haystack) and (best is None or sig.score > best.score):
+            best = sig
+    return best
 
 
 def match_path(path: str) -> Sig | None:
