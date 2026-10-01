@@ -1,0 +1,52 @@
+[identity]
+lan_ifaces = ["wlan0", "eth0", "enp0s31f6", "wlp2s0"]
+trusted_lan_cidr = "192.168.0.0/16"   # narrow this to your actual subnet
+admin_user = ""                          # optional; your login, for reports
+
+[firewall]
+apply = true
+# This is the load-bearing list: everything in it is a hole in the default-deny
+# wall. Current entry is KDE Connect, which needs the LAN. Add ports only when
+# you know why, and prefer binding a service to 127.0.0.1 instead.
+lan_allowlist = [1716]
+lan_allowlist_udp = [1716]
+drop_lanmr = [5355]
+drop_ssdp = [1900]
+
+[harden]
+ip_forward = false
+quarantine_sysctl_files = true
+llmnr = false
+
+[detect]
+interval_seconds = 3.0
+integrity_interval_seconds = 900.0
+fanout_conn_threshold = 60
+fanout_distinct_ip_threshold = 25
+notify_threshold = 60
+
+[respond]
+# observe   log and alert only
+# contain   drop the relaying port, freeze the process
+# kill      contain, then SIGTERM/SIGKILL
+# lockdown  kill, close all inbound, drop every relay port
+#
+# Start at observe. Move to contain once the baseline is clean and you trust
+# the false-positive rate. auto_kill stays false until you have run
+# `ward selftest` and watched a few days of `ward watch`.
+mode = "observe"
+contain_score = 70
+kill_score = 88
+lockdown_score = 95
+auto_kill = false
+auto_lockdown = false
+forensics = true
+cgroup_quarantine = true
+notify = true
+notify_threshold = 60
+
+[log]
+file = "/var/lib/ward/events.jsonl"
+mode = "hashchain"
+keep_days = 90
+max_events_per_minute = 240

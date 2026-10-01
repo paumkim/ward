@@ -1,0 +1,19 @@
+[Unit]
+Description=WARD hardening -- reapplied at boot
+Documentation=file:///usr/local/lib/ward/README.md
+After=network-pre.target firewalld.service
+Before=network.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/ward harden
+# If hardening fails, WARD still runs and still watches. A defender that
+# refuses to start because a sysctl was busy is worse than one that starts
+# noisy.
+SuccessExitStatus=0 1
+NoNewPrivileges=no
+
+[Install]
+WantedBy=multi-user.target

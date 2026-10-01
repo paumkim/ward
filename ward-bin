@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""ward -- keep this machine from being sold as a residential proxy.
+
+Installed to /usr/local/bin/ward. The package lives in /usr/local/lib/ward, so
+the importable parent directory is /usr/local/lib.
+"""
+
+import os
+import sys
+
+_INSTALLED = "/usr/local/lib"
+_SOURCE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+for _candidate in (_INSTALLED, _SOURCE):
+    if os.path.isdir(os.path.join(_candidate, "ward")):
+        sys.path.insert(0, _candidate)
+        break
+
+from ward.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

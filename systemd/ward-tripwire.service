@@ -1,0 +1,13 @@
+[Unit]
+Description=WARD tripwire -- re-lockdown if the daemon stops beating
+Documentation=file:///usr/local/lib/ward/README.md
+
+[Service]
+Type=oneshot
+# The point of this unit: killing the daemon must not silence the defender.
+# If ward's heartbeat goes stale while auto_lockdown is armed, containment is
+# re-applied from a separate, timer-driven unit that the daemon cannot stop.
+ExecStart=/usr/local/bin/ward tripwire
+# Also verifies the event chain, so a doctored log is noticed.
+ExecStartPost=/usr/local/bin/ward events --verify --limit 0
+NoNewPrivileges=no

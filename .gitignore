@@ -1,0 +1,34 @@
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+*.so
+
+# Local state: evidence, logs, baselines, quarantined binaries.
+# These are per-machine and contain process inventory and network peers.
+events.jsonl*
+baseline.json
+integrity.json
+state.json
+heartbeat
+self-hashes.json
+snapshots/
+quarantine/
+*.pcap
+
+# Local configuration overrides
+ward.toml.local
+/etc/ward/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Test/build leftovers
+build/
+dist/
+*.egg-info/
+.venv/
+venv/

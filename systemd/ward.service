@@ -1,0 +1,39 @@
+[Unit]
+Description=WARD -- residential-proxy defence daemon
+Documentation=file:///usr/local/lib/ward/README.md
+After=network-online.target firewalld.service nftables.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ward daemon --foreground
+ExecStartPost=/usr/local/bin/ward firewall --apply --no-persist
+Restart=always
+RestartSec=5
+
+# --- self-protection: WARD must not be the easiest thing to disable
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+ProtectHome=no
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=no
+RestrictSUIDSGID=no
+NoNewPrivileges=no
+PrivateTmp=no
+
+# The daemon must read /proc/* (including other users' processes and executables
+# -- that is how R01/R02/R05 work), write /run/ward and /var/lib/ward, and talk
+# to nft. Note: do NOT add InaccessiblePaths for ~/.ssh here. WARD hashes
+# authorized_keys as part of its integrity baseline, and pointing it at a file
+# that does not exist makes systemd refuse to start the unit at all (226).
+ReadWritePaths=/var/lib/ward /run/ward /etc/ward
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+LimitNOFILE=65536
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
