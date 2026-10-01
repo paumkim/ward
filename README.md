@@ -20,7 +20,7 @@ sudo ./install.sh
 
 sudo ward harden             # sysctl, LLMNR, sshd pinning, firewalld ports
 sudo ward firewall --apply   # default-deny inbound, no transit forwarding
-sudo ward selftest           # 52 checks that the detector actually fires
+sudo ward selftest           # 68 checks: detection, safety, performance, hygiene
 ward status                  # current verdict
 ```
 
